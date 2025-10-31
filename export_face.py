@@ -479,9 +479,9 @@ def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "")
         return False  # Skip empty XMP
         
     try:
-        # Create sidecar filename (same name with .xmp extension)
+        # Create sidecar filename (same name with original extension + .xmp)
         original_path_obj = Path(original_path)
-        filename = original_path_obj.stem + '.xmp'
+        filename = original_path_obj.name + '.xmp'
         
         if output_dir:
             output_base = Path(output_dir)
