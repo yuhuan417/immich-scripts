@@ -413,6 +413,24 @@ def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
     xmp_content += f'''   <xmp:CreatorTool>Immich Face Export Script</xmp:CreatorTool>
 '''
     
+    # Add people tags for general compatibility
+    unique_people = set()
+    for person in people:
+        person_name = person.get('name', 'Unknown')
+        if person_name and person_name != 'Unknown':
+            unique_people.add(person_name)
+    
+    if unique_people:
+        xmp_content += '''   <dc:subject>
+    <rdf:Bag>
+'''
+        for person_name in sorted(unique_people):
+            xmp_content += f'''     <rdf:li>{person_name}</rdf:li>
+'''
+        xmp_content += '''    </rdf:Bag>
+   </dc:subject>
+'''
+    
     # Start face regions
     xmp_content += '''   <mwg-rs:Regions>
     <rdf:Bag>
