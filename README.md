@@ -5,6 +5,10 @@
 
 A Python tool to export face recognition data from Immich photo management system to DigiKam-compatible XMP format files.
 
+## Other Tools
+
+- `ppocrv5-mobile-rknn/`: one-click pipeline for downloading official PP-OCRv5 mobile models, exporting ONNX, converting RKNN, and running accuracy analysis.
+
 ## 🌟 Features
 
 - **🔍 Face Recognition Data Export** - Retrieve complete face recognition data from Immich API

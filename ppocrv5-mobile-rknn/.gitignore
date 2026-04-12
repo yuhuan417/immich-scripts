@@ -1,0 +1,8 @@
+.venv-export/
+.venv-rknn/
+artifacts/
+output/
+PP-OCRv5_mobile_det/
+PP-OCRv5_mobile_rec/
+__pycache__/
+*.pyc
