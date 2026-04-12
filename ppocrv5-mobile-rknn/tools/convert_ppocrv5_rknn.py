@@ -35,6 +35,9 @@ COMMON_MODELS = {
         "dtype": "float32",
         "layout": "NCHW",
         "color_order": "BGR",
+        "op_target": {
+            "exSoftmax13": "cpu",
+        },
         "dynamic_input": [
             [[1, 3, 48, 320]],
             [[1, 3, 48, 640]],
@@ -257,6 +260,7 @@ def convert(
         ret = rknn.config(
             target_platform=target_platform,
             dynamic_input=config["dynamic_input"],
+            op_target=config.get("op_target"),
         )
         if ret != 0:
             raise RuntimeError(f"{model_name}: rknn.config failed with code {ret}")
@@ -327,6 +331,7 @@ def write_report(
                 f"layout: {config['layout']}",
                 f"color_order: {config['color_order']}",
                 f"dynamic_input: {config['dynamic_input']}",
+                f"op_target: {config.get('op_target', 'n/a')}",
                 (
                     f"output_last_dim: {config['output_last_dim']}"
                     if "output_last_dim" in config
