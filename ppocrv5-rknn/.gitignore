@@ -4,5 +4,9 @@ artifacts/
 output/
 PP-OCRv5_mobile_det/
 PP-OCRv5_mobile_rec/
+PP-OCRv5_server_det/
+PP-OCRv5_server_rec/
+detection/
+recognition/
 __pycache__/
 *.pyc

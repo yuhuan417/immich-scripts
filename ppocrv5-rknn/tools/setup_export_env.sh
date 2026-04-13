@@ -2,20 +2,18 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV_DIR="${ROOT_DIR}/.venv"
+VENV_DIR="${ROOT_DIR}/.venv-export"
 PYTHON_BIN=""
-RKNN_WHEEL=""
 
 usage() {
   cat <<'EOF'
 Usage:
-  tools/setup_convert_env.sh [--venv PATH] [--python PYTHON_BIN] [--rknn-wheel PATH]
+  tools/setup_export_env.sh [--venv PATH] [--python PYTHON_BIN]
 
 Options:
-  --venv PATH         Virtualenv location. Default: <repo>/.venv
+  --venv PATH         Virtualenv location. Default: <repo>/.venv-export
   --python BIN        Python executable used to create the virtualenv.
                       Default: python3.11, fallback to python3
-  --rknn-wheel PATH   Install rknn-toolkit2 from a local wheel instead of PyPI.
   -h, --help          Show this help.
 EOF
 }
@@ -28,10 +26,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --python)
       PYTHON_BIN="$2"
-      shift 2
-      ;;
-    --rknn-wheel)
-      RKNN_WHEEL="$2"
       shift 2
       ;;
     -h|--help)
@@ -67,7 +61,7 @@ print(f"{sys.version_info.major}.{sys.version_info.minor}")
 PY
 )"
 if [[ "${PYTHON_VERSION}" != "3.11" ]]; then
-  echo "Python 3.11 is required for the pinned conversion dependencies, got ${PYTHON_VERSION} from ${PYTHON_BIN}" >&2
+  echo "Python 3.11 is required for the pinned export dependencies, got ${PYTHON_VERSION} from ${PYTHON_BIN}" >&2
   exit 1
 fi
 
@@ -88,13 +82,7 @@ create_virtualenv
 VENV_PYTHON="${VENV_DIR}/bin/python"
 
 "${VENV_PYTHON}" -m pip install --upgrade "pip<26" "setuptools<81" wheel
-"${VENV_PYTHON}" -m pip install -r "${ROOT_DIR}/tools/requirements-convert.txt"
-
-if [[ -n "${RKNN_WHEEL}" ]]; then
-  "${VENV_PYTHON}" -m pip install "${RKNN_WHEEL}"
-else
-  "${VENV_PYTHON}" -m pip install "rknn-toolkit2==2.3.2"
-fi
+"${VENV_PYTHON}" -m pip install -r "${ROOT_DIR}/tools/requirements-export.txt"
 
 "${VENV_PYTHON}" - <<'PY'
 import importlib.metadata as metadata
@@ -102,10 +90,10 @@ import platform
 import sys
 
 required = {
-    "rknn-toolkit2": "2.3.2",
+    "paddlepaddle": "3.0.0",
+    "paddle2onnx": "2.0.2rc1",
     "numpy": "1.24.4",
     "onnx": "1.17.0",
-    "onnxruntime": "1.23.2",
 }
 
 print(f"Python: {sys.version.split()[0]}")
@@ -113,14 +101,11 @@ print(f"Platform: {platform.platform()}")
 for name, expected in required.items():
     installed = metadata.version(name)
     print(f"{name}: {installed}")
-    if installed.split('+', 1)[0] != expected:
+    if installed.split("+", 1)[0] != expected:
         raise SystemExit(f"{name} version mismatch: expected {expected}, got {installed}")
-
-from rknn.api import RKNN  # noqa: F401
-print("RKNN import: ok")
 PY
 
 echo
-echo "Environment ready."
-echo "Conversion command:"
-echo "  ${VENV_PYTHON} ${ROOT_DIR}/tools/convert_ppocrv5_rknn.py --model all --target-platform rk3576"
+echo "PP-OCRv5 export environment ready."
+echo "Export command:"
+echo "  ${VENV_PYTHON} ${ROOT_DIR}/tools/download_and_export_ppocrv5.py"

@@ -1,6 +1,4 @@
 # Pinned dependencies for ONNX -> RKNN conversion.
-# rknn-toolkit2 itself is installed by setup_convert_env.sh so the script can
-# optionally consume a local wheel.
 fast-histogram==0.14
 numpy==1.24.4
 onnx==1.17.0

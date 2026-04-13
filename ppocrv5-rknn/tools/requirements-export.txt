@@ -1,4 +1,4 @@
-# Pinned dependencies for PaddleOCR mobile model download and Paddle -> ONNX export.
+# Pinned dependencies for PP-OCRv5 Paddle download and Paddle -> ONNX export.
 numpy==1.24.4
 onnx==1.17.0
 paddle2onnx==2.0.2rc1

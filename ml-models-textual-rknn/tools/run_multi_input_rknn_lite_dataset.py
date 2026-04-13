@@ -18,6 +18,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", required=True, help="Path to the output .npz file.")
     parser.add_argument("--progress-every", type=int, default=100, help="Print progress every N samples.")
+    parser.add_argument(
+        "--data-format",
+        action="append",
+        choices=["nchw", "nhwc"],
+        help="Optional input data format(s) passed to RKNNLite.inference(). Repeat in exact input order.",
+    )
     return parser.parse_args()
 
 
@@ -46,7 +52,12 @@ def main() -> int:
         outputs_acc: list[list[np.ndarray]] = []
         for idx in range(num_samples):
             sample_inputs = [tensor[idx : idx + 1] for tensor in dataset_inputs]
-            sample_outputs = rknn.inference(inputs=sample_inputs)
+            if args.data_format is not None:
+                if len(args.data_format) != len(sample_inputs):
+                    raise ValueError("--data-format count must match the number of inputs.")
+                sample_outputs = rknn.inference(inputs=sample_inputs, data_format=args.data_format)
+            else:
+                sample_outputs = rknn.inference(inputs=sample_inputs)
             if not outputs_acc:
                 outputs_acc = [[] for _ in sample_outputs]
             for out_idx, value in enumerate(sample_outputs):
