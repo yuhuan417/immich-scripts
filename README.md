@@ -8,6 +8,7 @@ A Python tool to export face recognition data from Immich photo management syste
 ## Other Tools
 
 - `ppocrv5-mobile-rknn/`: one-click pipeline for downloading official PP-OCRv5 mobile models, exporting ONNX, converting RKNN, and running accuracy analysis.
+- `ml-models-textual-rknn/`: utilities for validating `ml-models` textual ONNX/RKNN exports on RK3576 hardware.
 
 ## 🌟 Features
 

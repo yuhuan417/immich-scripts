@@ -37,6 +37,8 @@ wheels/
 venv/
 env/
 ENV/
+ml-models-textual-rknn/output/
+ml-models-textual-rknn/.venv/
 
 # IDE files
 .vscode/
