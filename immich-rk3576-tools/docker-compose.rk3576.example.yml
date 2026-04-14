@@ -1,0 +1,23 @@
+name: immich
+
+services:
+  immich-machine-learning:
+    container_name: immich_machine_learning-rknn
+    image: immich-ml:rknn-rk3576-local
+    security_opt:
+      - systempaths=unconfined
+      - apparmor=unconfined
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - model-cache:/cache
+    env_file:
+      - .env
+    restart: always
+    healthcheck:
+      disable: false
+    ports:
+      - 3003:3003
+
+volumes:
+  model-cache:
