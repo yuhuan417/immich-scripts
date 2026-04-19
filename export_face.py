@@ -47,6 +47,7 @@ class ConfigLoader:
         """Load configuration from environment variables."""
         env_mappings = {
             'IMMICH_BASE_URL': ['immich', 'base_url'],
+            'IMMICH_API_KEY': ['immich', 'api_key'],
             'IMMICH_EMAIL': ['immich', 'email'],
             'IMMICH_PASSWORD': ['immich', 'password'],
             'IMMICH_REQUEST_TIMEOUT': ['settings', 'request_timeout'],
@@ -93,6 +94,7 @@ class ConfigLoader:
         """Get Immich connection configuration."""
         return {
             'base_url': self.get('immich.base_url', 'https://www.blahblah.com'),
+            'api_key': self.get('immich.api_key', ''),
             'email': self.get('immich.email', ''),
             'password': self.get('immich.password', '')
         }
@@ -114,26 +116,36 @@ class ConfigLoader:
     def validate_immich_config(self) -> bool:
         """Validate that required Immich configuration is present."""
         immich_config = self.get_immich_config()
+        api_key = immich_config['api_key']
+        email = immich_config['email']
+        password = immich_config['password']
+        base_url = immich_config['base_url']
         
-        if not immich_config['email'] or not immich_config['password']:
-            print("❌ Configuration error: Email and password are required")
-            print("   Please set them in config.json or use environment variables:")
-            print("   IMMICH_EMAIL and IMMICH_PASSWORD")
-            return False
-        
-        if immich_config['base_url'] == 'https://www.blahblah.com':
+        if base_url in {'https://www.blahblah.com', 'https://your-immich-server.com'}:
             print("❌ Configuration error: Please update the Immich server URL")
             print("   Set it in config.json or use environment variable:")
             print("   IMMICH_BASE_URL")
             return False
-        
-        return True
+
+        if api_key and api_key != 'your-api-key':
+            return True
+
+        if email and password and email != 'your-email@example.com' and password != 'your-password':
+            return True
+
+        print("❌ Configuration error: Immich API key is required, or provide email/password as a fallback")
+        print("   Recommended: set immich.api_key in config.json or export IMMICH_API_KEY")
+        print("   Fallback: set IMMICH_EMAIL and IMMICH_PASSWORD")
+        return False
     
     def print_config_summary(self) -> None:
         """Print a summary of loaded configuration."""
+        auth_method = "API key" if self.get('immich.api_key') else "Email/password fallback"
         print("\n📋 Configuration Summary:")
         print(f"   Server URL: {self.get('immich.base_url')}")
-        print(f"   Email: {self.get('immich.email')}")
+        print(f"   Authentication: {auth_method}")
+        if auth_method != "API key":
+            print(f"   Email: {self.get('immich.email')}")
         print(f"   Timeout: {self.get('settings.request_timeout')}s")
         print(f"   Retry Attempts: {self.get('settings.retry_attempts')}")
 
@@ -153,8 +165,8 @@ DEFAULT_HEADERS = {
 }
 
 
-def authenticate(email: str, password: str) -> Optional[str]:
-    """Authenticate with Immich API and return access token."""
+def authenticate_with_password(email: str, password: str) -> Optional[str]:
+    """Authenticate with Immich using email/password and return access token."""
     payload = json.dumps({"email": email, "password": password})
     
     try:
@@ -170,14 +182,35 @@ def authenticate(email: str, password: str) -> Optional[str]:
         return None
 
 
-def get_auth_headers(access_token: str) -> Dict[str, str]:
-    """Get headers with authentication cookie."""
+def get_auth_headers(access_token: Optional[str] = None, api_key: Optional[str] = None) -> Dict[str, str]:
+    """Build authenticated headers for either API key or access-token auth."""
     headers = DEFAULT_HEADERS.copy()
-    headers['Cookie'] = f'immich_access_token={access_token}'
+
+    if api_key:
+        headers['x-api-key'] = api_key
+    elif access_token:
+        headers['Cookie'] = f'immich_access_token={access_token}'
+
     return headers
 
 
-def get_all_asset_ids(access_token: str, max_assets: Optional[int] = None) -> List[str]:
+def create_auth_headers(immich_config: Dict[str, str]) -> Optional[Dict[str, str]]:
+    """Create authenticated headers, preferring API key over password login."""
+    api_key = immich_config.get('api_key', '')
+    if api_key:
+        return get_auth_headers(api_key=api_key)
+
+    access_token = authenticate_with_password(
+        immich_config.get('email', ''),
+        immich_config.get('password', '')
+    )
+    if not access_token:
+        return None
+
+    return get_auth_headers(access_token=access_token)
+
+
+def get_all_asset_ids(auth_headers: Dict[str, str], max_assets: Optional[int] = None) -> List[str]:
     """Get all asset IDs efficiently using search API."""
     asset_ids = []
     page = 1
@@ -199,7 +232,7 @@ def get_all_asset_ids(access_token: str, max_assets: Optional[int] = None) -> Li
             
             response = requests.post(
                 f"{IMMICH_API_BASE}/search/metadata",
-                headers=get_auth_headers(access_token),
+                headers=auth_headers,
                 json=search_payload
             )
             response.raise_for_status()
@@ -249,11 +282,11 @@ def get_all_asset_ids(access_token: str, max_assets: Optional[int] = None) -> Li
     return asset_ids
 
 
-def get_asset_with_faces(access_token: str, asset_id: str) -> Optional[Dict[str, Any]]:
+def get_asset_with_faces(auth_headers: Dict[str, str], asset_id: str) -> Optional[Dict[str, Any]]:
     """Get detailed asset info including face data."""
     try:
         response = requests.get(f"{IMMICH_API_BASE}/assets/{asset_id}", 
-                              headers=get_auth_headers(access_token))
+                              headers=auth_headers)
         response.raise_for_status()
         
         return response.json()
@@ -538,12 +571,12 @@ def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "")
         return False
 
 
-def process_assets_with_faces(access_token: str, max_assets: Optional[int] = None) -> List[Dict[str, Any]]:
+def process_assets_with_faces(auth_headers: Dict[str, str], max_assets: Optional[int] = None) -> List[Dict[str, Any]]:
     """Process assets and collect those with face recognition data."""
     processed_assets = []
     
     print("Step 1: Collecting asset IDs...")
-    asset_ids = get_all_asset_ids(access_token, max_assets)
+    asset_ids = get_all_asset_ids(auth_headers, max_assets)
     
     if not asset_ids:
         print("No asset IDs collected")
@@ -560,7 +593,7 @@ def process_assets_with_faces(access_token: str, max_assets: Optional[int] = Non
     total_with_faces = 0
     
     for i, asset_id in enumerate(asset_ids):
-        detailed_asset = get_asset_with_faces(access_token, asset_id)
+        detailed_asset = get_asset_with_faces(auth_headers, asset_id)
         
         if detailed_asset:
             people = detailed_asset.get('people', [])
@@ -593,7 +626,7 @@ def process_assets_with_faces(access_token: str, max_assets: Optional[int] = Non
     return processed_assets
 
 
-def export_faces_to_json(access_token: str, json_output_dir: str = "json_exports", max_assets: Optional[int] = None) -> Optional[str]:
+def export_faces_to_json(auth_headers: Dict[str, str], json_output_dir: str = "json_exports", max_assets: Optional[int] = None) -> Optional[str]:
     """Export face recognition data to JSON file (Stage 1)."""
     print("Starting face recognition export to JSON format (Stage 1)...")
     
@@ -602,7 +635,7 @@ def export_faces_to_json(access_token: str, json_output_dir: str = "json_exports
     output_path.mkdir(exist_ok=True)
     
     # Process assets with faces
-    processed_assets = process_assets_with_faces(access_token, max_assets)
+    processed_assets = process_assets_with_faces(auth_headers, max_assets)
     
     if not processed_assets:
         print("No assets with faces found")
@@ -733,7 +766,7 @@ def export_faces_to_digikam_xmp_from_json(json_file_path: str, output_dir: str =
     return True
 
 
-def export_faces_to_digikam_xmp(access_token: str, output_dir: str = "xmp_sidecars", max_assets: Optional[int] = None) -> bool:
+def export_faces_to_digikam_xmp(auth_headers: Dict[str, str], output_dir: str = "xmp_sidecars", max_assets: Optional[int] = None) -> bool:
     """Export face recognition data to DigiKam XMP sidecar files."""
     print("Starting face recognition export to DigiKam XMP format...")
     
@@ -742,7 +775,7 @@ def export_faces_to_digikam_xmp(access_token: str, output_dir: str = "xmp_sideca
     output_path.mkdir(exist_ok=True)
     
     # Process assets with faces
-    processed_assets = process_assets_with_faces(access_token, max_assets)
+    processed_assets = process_assets_with_faces(auth_headers, max_assets)
     
     if not processed_assets:
         print("No assets with faces found")
@@ -918,8 +951,7 @@ def main():
     
     # Get configuration
     immich_config = config.get_immich_config()
-    email = immich_config['email']
-    password = immich_config['password']
+    auth_headers = create_auth_headers(immich_config)
     output_config = config.get_output_config()
     
     # Use custom directories if specified, otherwise use config
@@ -933,16 +965,18 @@ def main():
     if args.max_assets:
         print(f"Maximum assets to process: {args.max_assets}")
     
-    # Step 1: Authenticate
-    access_token = authenticate(email, password)
-    if not access_token:
-        print("❌ Authentication failed. Please check your credentials and server URL.")
+    # Step 1: Build authentication headers
+    if not auth_headers:
+        print("❌ Authentication failed. Please check your API key or fallback credentials.")
         return
     
-    print("✅ Authentication successful")
+    if immich_config['api_key']:
+        print("✅ Using API key authentication")
+    else:
+        print("✅ Authentication successful via email/password fallback")
     
     # Stage 1: Export to JSON
-    json_file_path = export_faces_to_json(access_token, json_dir, args.max_assets)
+    json_file_path = export_faces_to_json(auth_headers, json_dir, args.max_assets)
     
     if not json_file_path:
         print("❌ Failed to export face data to JSON")

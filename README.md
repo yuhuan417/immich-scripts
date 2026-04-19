@@ -17,7 +17,7 @@ A Python tool to export face recognition data from Immich photo management syste
 - **📁 Directory Structure Preservation** - Output files maintain original photo directory structure
 - **🎯 DigiKam Compatible** - Generate standard XMP sidecar files, fully compatible with DigiKam
 - **⚙️ Flexible Configuration** - Support JSON configuration files and environment variables
-- **🔒 Security First** - Sensitive configurations automatically git-ignored, protecting your authentication info
+- **🔒 Security First** - Prefer Immich API key authentication; sensitive configurations are automatically git-ignored
 - **📊 Detailed Statistics** - Generate comprehensive export statistics reports
 - **🚀 Efficient Processing** - Smart batch processing, supports large photo libraries
 - **🔄 Two-Stage Processing** - Export to JSON first, then generate XMP files (flexible workflow)
@@ -52,8 +52,9 @@ Fill in your Immich server information in `config.json`:
 {
   "immich": {
     "base_url": "https://your-immich-server.com",
-    "email": "your-email@example.com",
-    "password": "your-password"
+    "api_key": "your-api-key",
+    "email": "",
+    "password": ""
   },
   "settings": {
     "request_timeout": 30,
@@ -69,9 +70,10 @@ Fill in your Immich server information in `config.json`:
 #### Method 2: Using Environment Variables
 ```bash
 export IMMICH_BASE_URL="https://your-immich-server.com"
-export IMMICH_EMAIL="your-email@example.com"
-export IMMICH_PASSWORD="your-password"
+export IMMICH_API_KEY="your-api-key"
 ```
+
+`IMMICH_API_KEY` is the recommended authentication method. `IMMICH_EMAIL` and `IMMICH_PASSWORD` are still supported as a fallback for older setups.
 
 ### 4. Run Export
 
@@ -145,8 +147,9 @@ digikam_xmp_sidecars/
 | Configuration Item | Environment Variable | Default Value | Description |
 |--------------------|---------------------|---------------|-------------|
 | `immich.base_url` | `IMMICH_BASE_URL` | - | Immich server address |
-| `immich.email` | `IMMICH_EMAIL` | - | Login email |
-| `immich.password` | `IMMICH_PASSWORD` | - | Login password |
+| `immich.api_key` | `IMMICH_API_KEY` | - | Immich API key (recommended) |
+| `immich.email` | `IMMICH_EMAIL` | - | Login email (fallback only) |
+| `immich.password` | `IMMICH_PASSWORD` | - | Login password (fallback only) |
 | `settings.request_timeout` | `IMMICH_REQUEST_TIMEOUT` | 30 | API request timeout (seconds) |
 | `settings.retry_attempts` | `IMMICH_RETRY_ATTEMPTS` | 3 | Number of retry attempts |
 | `output.digikam_xmp_dir` | `OUTPUT_DIGIKAM_XMP_DIR` | digikam_xmp_sidecars | XMP output directory |
@@ -166,15 +169,14 @@ python -c "from export_face import ConfigLoader; print('OK')"
 ### Configuration Testing
 ```bash
 # Test environment variable configuration
-export IMMICH_EMAIL="test@example.com"
-export IMMICH_PASSWORD="testpass"
+export IMMICH_API_KEY="test-api-key"
 python -c "from export_face import ConfigLoader; config = ConfigLoader(); print('Config OK')"
 ```
 
 ## 🐛 Common Issues
 
 ### Q: Authentication failed?
-**A:** Check if server address, email, and password are correct, and ensure the server is accessible.
+**A:** Check if the server address and API key are correct, and ensure the server is accessible. If you use the legacy fallback flow, also verify email and password.
 
 ### Q: No XMP files generated?
 **A:** Confirm that your photos have been processed for face recognition in Immich. Only photos containing face data will generate XMP files.
