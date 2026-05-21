@@ -7,10 +7,25 @@
   },
   "settings": {
     "request_timeout": 30,
-    "retry_attempts": 3
+    "retry_attempts": 3,
+    "retry_backoff_seconds": 1
   },
   "output": {
     "digikam_xmp_dir": "digikam_xmp_sidecars",
     "json_export_dir": "json_exports"
+  },
+  "xmp": {
+    "sidecar_naming": "extension-xmp",
+    "include_unnamed_faces": false,
+    "unnamed_face_name": "Unnamed Face",
+    "write_dc_subject": true,
+    "write_digikam_tags": false,
+    "write_lightroom_hierarchical_subject": false,
+    "people_tag_prefix": "People"
+  },
+  "search": {
+    "asset_type": "IMAGE",
+    "visibility": "timeline",
+    "with_people": true
   }
 }

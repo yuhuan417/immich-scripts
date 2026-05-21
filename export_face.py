@@ -1,1004 +1,1054 @@
 #!/usr/bin/env python3
 """
-Face recognition export script for Immich.
-Uses search API to get asset IDs, then detailed API to get face data.
-Exports face recognition data to DigiKam-compatible XMP format.
-Supports two-stage processing: JSON export first, then XMP generation.
+Export Immich face metadata to JSON and DigiKam/Immich-readable XMP sidecars.
+
+The XMP output is intentionally centered on MWG region metadata. Immich imports
+sidecar faces through exiftool's RegionInfo structure, which requires
+AppliedToDimensions and RegionList. DigiKam also understands this MWG face
+region format.
 """
 
-import requests
+import argparse
+import copy
 import json
 import os
-import argparse
-from typing import Dict, Any, Optional, List
-from datetime import datetime
+import time
+import xml.etree.ElementTree as ET
+from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import requests
+
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "immich": {
+        "base_url": "https://your-immich-server.com",
+        "api_key": "",
+        "email": "",
+        "password": "",
+    },
+    "settings": {
+        "request_timeout": 30,
+        "retry_attempts": 3,
+        "retry_backoff_seconds": 1,
+    },
+    "output": {
+        "digikam_xmp_dir": "digikam_xmp_sidecars",
+        "json_export_dir": "json_exports",
+    },
+    "xmp": {
+        "sidecar_naming": "extension-xmp",
+        "include_unnamed_faces": False,
+        "unnamed_face_name": "Unnamed Face",
+        "write_dc_subject": True,
+        "write_digikam_tags": False,
+        "write_lightroom_hierarchical_subject": False,
+        "people_tag_prefix": "People",
+    },
+    "search": {
+        "asset_type": "IMAGE",
+        "visibility": "timeline",
+        "with_people": True,
+    },
+}
+
+ENV_MAPPINGS = {
+    "IMMICH_BASE_URL": ("immich", "base_url"),
+    "IMMICH_API_KEY": ("immich", "api_key"),
+    "IMMICH_EMAIL": ("immich", "email"),
+    "IMMICH_PASSWORD": ("immich", "password"),
+    "IMMICH_REQUEST_TIMEOUT": ("settings", "request_timeout"),
+    "IMMICH_RETRY_ATTEMPTS": ("settings", "retry_attempts"),
+    "IMMICH_RETRY_BACKOFF_SECONDS": ("settings", "retry_backoff_seconds"),
+    "OUTPUT_DIGIKAM_XMP_DIR": ("output", "digikam_xmp_dir"),
+    "OUTPUT_JSON_EXPORT_DIR": ("output", "json_export_dir"),
+    "XMP_SIDECAR_NAMING": ("xmp", "sidecar_naming"),
+    "XMP_INCLUDE_UNNAMED_FACES": ("xmp", "include_unnamed_faces"),
+    "XMP_WRITE_DC_SUBJECT": ("xmp", "write_dc_subject"),
+    "XMP_WRITE_DIGIKAM_TAGS": ("xmp", "write_digikam_tags"),
+    "XMP_WRITE_LIGHTROOM_HIERARCHICAL_SUBJECT": ("xmp", "write_lightroom_hierarchical_subject"),
+    "XMP_PEOPLE_TAG_PREFIX": ("xmp", "people_tag_prefix"),
+    "IMMICH_SEARCH_ASSET_TYPE": ("search", "asset_type"),
+    "IMMICH_SEARCH_VISIBILITY": ("search", "visibility"),
+}
+
+RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+X_NS = "adobe:ns:meta/"
+XMP_NS = "http://ns.adobe.com/xap/1.0/"
+DC_NS = "http://purl.org/dc/elements/1.1/"
+MWG_RS_NS = "http://www.metadataworkinggroup.com/schemas/regions/"
+ST_DIM_NS = "http://ns.adobe.com/xap/1.0/sType/Dimensions#"
+ST_AREA_NS = "http://ns.adobe.com/xmp/sType/Area#"
+DIGIKAM_NS = "http://www.digikam.org/ns/1.0/"
+LR_NS = "http://ns.adobe.com/lightroom/1.0/"
+
+for prefix, uri in [
+    ("x", X_NS),
+    ("rdf", RDF_NS),
+    ("xmp", XMP_NS),
+    ("dc", DC_NS),
+    ("mwg-rs", MWG_RS_NS),
+    ("stDim", ST_DIM_NS),
+    ("stArea", ST_AREA_NS),
+    ("digiKam", DIGIKAM_NS),
+    ("lr", LR_NS),
+]:
+    ET.register_namespace(prefix, uri)
+
+
+def qname(namespace: str, tag: str) -> str:
+    return f"{{{namespace}}}{tag}"
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    result = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def coerce_env_value(raw: str, current_value: Any) -> Any:
+    if isinstance(current_value, bool):
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    if isinstance(current_value, int) and not isinstance(current_value, bool):
+        return int(raw)
+    if isinstance(current_value, float):
+        return float(raw)
+    return raw
+
+
+def set_nested(data: Dict[str, Any], path: Iterable[str], value: Any) -> None:
+    current = data
+    parts = list(path)
+    for key in parts[:-1]:
+        current = current.setdefault(key, {})
+    current[parts[-1]] = value
 
 
 class ConfigLoader:
-    """Configuration loader that supports JSON files and environment variables."""
-    
+    """Configuration loader supporting JSON files and environment variables."""
+
     def __init__(self, config_file: str = "config.json"):
-        """Initialize configuration loader."""
         self.config_file = config_file
-        self.config_data = {}
+        self.config_data = copy.deepcopy(DEFAULT_CONFIG)
+        self.config_loaded = False
         self.load_config()
-    
+
     def load_config(self) -> None:
-        """Load configuration from file and environment variables."""
-        # Load from JSON file if it exists
+        file_config: Dict[str, Any] = {}
         if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, 'r', encoding='utf-8') as f:
-                    self.config_data = json.load(f)
-                print(f"✅ Configuration loaded from {self.config_file}")
-            except (json.JSONDecodeError, IOError) as e:
-                print(f"⚠️  Error loading config file {self.config_file}: {e}")
-                print("   Using environment variables and defaults")
-                self.config_data = {}
-        else:
-            print(f"⚠️  Config file {self.config_file} not found")
-            print("   Using environment variables and defaults")
-        
-        # Override with environment variables if present
+            with open(self.config_file, "r", encoding="utf-8") as config_handle:
+                file_config = json.load(config_handle)
+            self.config_loaded = True
+
+        self.config_data = deep_merge(DEFAULT_CONFIG, file_config)
         self._load_from_env()
-    
+
     def _load_from_env(self) -> None:
-        """Load configuration from environment variables."""
-        env_mappings = {
-            'IMMICH_BASE_URL': ['immich', 'base_url'],
-            'IMMICH_API_KEY': ['immich', 'api_key'],
-            'IMMICH_EMAIL': ['immich', 'email'],
-            'IMMICH_PASSWORD': ['immich', 'password'],
-            'IMMICH_REQUEST_TIMEOUT': ['settings', 'request_timeout'],
-            'IMMICH_RETRY_ATTEMPTS': ['settings', 'retry_attempts'],
-            'OUTPUT_DIGIKAM_XMP_DIR': ['output', 'digikam_xmp_dir']
-        }
-        
-        for env_var, config_path in env_mappings.items():
-            env_value = os.getenv(env_var)
-            if env_value:
-                self._set_nested_value(self.config_data, config_path, env_value)
-                print(f"✅ Loaded {env_var} from environment")
-    
-    def _set_nested_value(self, data: Dict[str, Any], path: list, value: str) -> None:
-        """Set nested dictionary value from path list."""
-        current = data
-        for key in path[:-1]:
-            if key not in current:
-                current[key] = {}
-            current = current[key]
-        
-        # Convert numeric values
-        if path[-1] in ['request_timeout', 'retry_attempts']:
-            try:
-                current[path[-1]] = int(value)
-            except ValueError:
-                current[path[-1]] = value
-        else:
-            current[path[-1]] = value
-    
+        for env_name, config_path in ENV_MAPPINGS.items():
+            raw_value = os.getenv(env_name)
+            if raw_value is None:
+                continue
+            current_value = self.get(".".join(config_path))
+            set_nested(self.config_data, config_path, coerce_env_value(raw_value, current_value))
+
     def get(self, path: str, default: Any = None) -> Any:
-        """Get configuration value using dot notation (e.g., 'immich.base_url')."""
-        keys = path.split('.')
-        current = self.config_data
-        
-        try:
-            for key in keys:
-                current = current[key]
-            return current
-        except (KeyError, TypeError):
-            return default
-    
+        current: Any = self.config_data
+        for key in path.split("."):
+            if not isinstance(current, dict) or key not in current:
+                return default
+            current = current[key]
+        return current
+
     def get_immich_config(self) -> Dict[str, str]:
-        """Get Immich connection configuration."""
         return {
-            'base_url': self.get('immich.base_url', 'https://www.blahblah.com'),
-            'api_key': self.get('immich.api_key', ''),
-            'email': self.get('immich.email', ''),
-            'password': self.get('immich.password', '')
+            "base_url": str(self.get("immich.base_url", "")).rstrip("/"),
+            "api_key": str(self.get("immich.api_key", "")),
+            "email": str(self.get("immich.email", "")),
+            "password": str(self.get("immich.password", "")),
         }
-    
+
     def get_output_config(self) -> Dict[str, str]:
-        """Get output configuration."""
         return {
-            'digikam_xmp_dir': self.get('output.digikam_xmp_dir', 'digikam_xmp_sidecars'),
-            'json_export_dir': self.get('output.json_export_dir', 'json_exports')
+            "digikam_xmp_dir": str(self.get("output.digikam_xmp_dir", "digikam_xmp_sidecars")),
+            "json_export_dir": str(self.get("output.json_export_dir", "json_exports")),
         }
-    
+
     def get_settings_config(self) -> Dict[str, Any]:
-        """Get general settings configuration."""
         return {
-            'request_timeout': self.get('settings.request_timeout', 30),
-            'retry_attempts': self.get('settings.retry_attempts', 3)
+            "request_timeout": int(self.get("settings.request_timeout", 30)),
+            "retry_attempts": int(self.get("settings.retry_attempts", 3)),
+            "retry_backoff_seconds": float(self.get("settings.retry_backoff_seconds", 1)),
         }
-    
+
+    def get_xmp_config(self) -> Dict[str, Any]:
+        return {
+            "sidecar_naming": self.get("xmp.sidecar_naming", "extension-xmp"),
+            "include_unnamed_faces": bool(self.get("xmp.include_unnamed_faces", False)),
+            "unnamed_face_name": str(self.get("xmp.unnamed_face_name", "Unnamed Face")),
+            "write_dc_subject": bool(self.get("xmp.write_dc_subject", True)),
+            "write_digikam_tags": bool(self.get("xmp.write_digikam_tags", False)),
+            "write_lightroom_hierarchical_subject": bool(
+                self.get("xmp.write_lightroom_hierarchical_subject", False)
+            ),
+            "people_tag_prefix": str(self.get("xmp.people_tag_prefix", "People")),
+        }
+
+    def get_search_config(self) -> Dict[str, Any]:
+        return {
+            "asset_type": self.get("search.asset_type", "IMAGE"),
+            "visibility": self.get("search.visibility", "timeline"),
+            "with_people": bool(self.get("search.with_people", True)),
+        }
+
     def validate_immich_config(self) -> bool:
-        """Validate that required Immich configuration is present."""
-        immich_config = self.get_immich_config()
-        api_key = immich_config['api_key']
-        email = immich_config['email']
-        password = immich_config['password']
-        base_url = immich_config['base_url']
-        
-        if base_url in {'https://www.blahblah.com', 'https://your-immich-server.com'}:
-            print("❌ Configuration error: Please update the Immich server URL")
-            print("   Set it in config.json or use environment variable:")
-            print("   IMMICH_BASE_URL")
+        immich = self.get_immich_config()
+        base_url = immich["base_url"]
+        api_key = immich["api_key"]
+        email = immich["email"]
+        password = immich["password"]
+
+        if not base_url or base_url in {"https://www.blahblah.com", "https://your-immich-server.com"}:
+            print("Configuration error: set immich.base_url or IMMICH_BASE_URL")
             return False
 
-        if api_key and api_key != 'your-api-key':
+        if api_key and api_key != "your-api-key":
             return True
 
-        if email and password and email != 'your-email@example.com' and password != 'your-password':
+        if email and password and email != "your-email@example.com" and password != "your-password":
             return True
 
-        print("❌ Configuration error: Immich API key is required, or provide email/password as a fallback")
-        print("   Recommended: set immich.api_key in config.json or export IMMICH_API_KEY")
-        print("   Fallback: set IMMICH_EMAIL and IMMICH_PASSWORD")
+        print("Configuration error: set immich.api_key or fallback email/password credentials")
         return False
-    
+
     def print_config_summary(self) -> None:
-        """Print a summary of loaded configuration."""
-        auth_method = "API key" if self.get('immich.api_key') else "Email/password fallback"
-        print("\n📋 Configuration Summary:")
-        print(f"   Server URL: {self.get('immich.base_url')}")
-        print(f"   Authentication: {auth_method}")
-        if auth_method != "API key":
-            print(f"   Email: {self.get('immich.email')}")
-        print(f"   Timeout: {self.get('settings.request_timeout')}s")
-        print(f"   Retry Attempts: {self.get('settings.retry_attempts')}")
+        immich = self.get_immich_config()
+        settings = self.get_settings_config()
+        xmp = self.get_xmp_config()
+        auth_method = "API key" if immich["api_key"] else "email/password fallback"
+
+        print("Configuration summary:")
+        print(f"  Config file: {self.config_file if self.config_loaded else 'not found, using defaults/env'}")
+        print(f"  Server URL: {immich['base_url']}")
+        print(f"  Authentication: {auth_method}")
+        print(f"  Timeout: {settings['request_timeout']}s")
+        print(f"  Retry attempts: {settings['retry_attempts']}")
+        print(f"  Sidecar naming: {xmp['sidecar_naming']}")
 
 
-# Global config loader instance
-config = ConfigLoader()
-
-# Get configuration from config file
-immich_config = config.get_immich_config()
-IMMICH_BASE_URL = immich_config['base_url']
-IMMICH_API_BASE = f"{IMMICH_BASE_URL}/api"
-output_config = config.get_output_config()
-
-DEFAULT_HEADERS = {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json'
-}
+class ImmichApiError(RuntimeError):
+    pass
 
 
-def authenticate_with_password(email: str, password: str) -> Optional[str]:
-    """Authenticate with Immich using email/password and return access token."""
-    payload = json.dumps({"email": email, "password": password})
-    
+class ImmichClient:
+    """Small Immich API client with auth, timeout, and retry behavior."""
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "",
+        email: str = "",
+        password: str = "",
+        request_timeout: int = 30,
+        retry_attempts: int = 3,
+        retry_backoff_seconds: float = 1,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.api_base = f"{self.base_url}/api"
+        self.api_key = api_key
+        self.email = email
+        self.password = password
+        self.request_timeout = request_timeout
+        self.retry_attempts = max(1, retry_attempts)
+        self.retry_backoff_seconds = retry_backoff_seconds
+        self.session = requests.Session()
+        self.session.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
+
+        if self.api_key:
+            self.session.headers.update({"x-api-key": self.api_key})
+
+    def authenticate(self) -> None:
+        if self.api_key:
+            return
+
+        if not self.email or not self.password:
+            raise ImmichApiError("missing API key or email/password credentials")
+
+        response = self.request(
+            "POST",
+            "/auth/login",
+            json_body={"email": self.email, "password": self.password},
+            authenticated=False,
+        )
+        access_token = response.get("accessToken") if isinstance(response, dict) else None
+        if not access_token:
+            raise ImmichApiError("authentication response did not contain accessToken")
+        self.session.headers.update({"Cookie": f"immich_access_token={access_token}"})
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        json_body: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        authenticated: bool = True,
+    ) -> Any:
+        url = f"{self.api_base}{path}"
+        last_error: Optional[BaseException] = None
+
+        for attempt in range(1, self.retry_attempts + 1):
+            try:
+                response = self.session.request(
+                    method,
+                    url,
+                    json=json_body,
+                    params=params,
+                    timeout=self.request_timeout,
+                )
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt < self.retry_attempts:
+                    self._sleep_before_retry(attempt)
+                    continue
+                raise ImmichApiError(f"{method} {path} failed: {exc}") from exc
+
+            if response.status_code in {429, 500, 502, 503, 504} and attempt < self.retry_attempts:
+                last_error = ImmichApiError(f"{method} {path} returned HTTP {response.status_code}")
+                self._sleep_before_retry(attempt)
+                continue
+
+            if not response.ok:
+                detail = response.text[:500]
+                auth_note = " Check credentials." if authenticated and response.status_code in {401, 403} else ""
+                raise ImmichApiError(f"{method} {path} returned HTTP {response.status_code}: {detail}{auth_note}")
+
+            if not response.content:
+                return None
+
+            try:
+                return response.json()
+            except json.JSONDecodeError as exc:
+                raise ImmichApiError(f"{method} {path} returned invalid JSON") from exc
+
+        raise ImmichApiError(f"{method} {path} failed after retries: {last_error}")
+
+    def _sleep_before_retry(self, attempt: int) -> None:
+        time.sleep(self.retry_backoff_seconds * attempt)
+
+    def search_assets(self, page: int, size: int, search_config: Dict[str, Any]) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "page": page,
+            "size": size,
+            "type": search_config.get("asset_type", "IMAGE"),
+            "visibility": search_config.get("visibility", "timeline"),
+            "withPeople": bool(search_config.get("with_people", True)),
+        }
+        return self.request("POST", "/search/metadata", json_body=payload)
+
+    def get_asset(self, asset_id: str) -> Dict[str, Any]:
+        return self.request("GET", f"/assets/{asset_id}")
+
+    def get_faces(self, asset_id: str) -> List[Dict[str, Any]]:
+        data = self.request("GET", "/faces", params={"id": asset_id})
+        if not isinstance(data, list):
+            raise ImmichApiError(f"GET /faces?id={asset_id} returned {type(data).__name__}, expected list")
+        return data
+
+
+def as_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    if value is None:
+        return default
     try:
-        response = requests.post(f"{IMMICH_API_BASE}/auth/login", 
-                               headers=DEFAULT_HEADERS, data=payload)
-        response.raise_for_status()
-        return response.json()["accessToken"]
-    except requests.exceptions.RequestException as e:
-        print(f"Authentication failed: {e}")
-        return None
-    except (KeyError, json.JSONDecodeError) as e:
-        print(f"Failed to parse authentication response: {e}")
-        return None
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
-def get_auth_headers(access_token: Optional[str] = None, api_key: Optional[str] = None) -> Dict[str, str]:
-    """Build authenticated headers for either API key or access-token auth."""
-    headers = DEFAULT_HEADERS.copy()
-
-    if api_key:
-        headers['x-api-key'] = api_key
-    elif access_token:
-        headers['Cookie'] = f'immich_access_token={access_token}'
-
-    return headers
+def clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
+    return max(lower, min(upper, value))
 
 
-def create_auth_headers(immich_config: Dict[str, str]) -> Optional[Dict[str, str]]:
-    """Create authenticated headers, preferring API key over password login."""
-    api_key = immich_config.get('api_key', '')
-    if api_key:
-        return get_auth_headers(api_key=api_key)
-
-    access_token = authenticate_with_password(
-        immich_config.get('email', ''),
-        immich_config.get('password', '')
-    )
-    if not access_token:
-        return None
-
-    return get_auth_headers(access_token=access_token)
-
-
-def get_all_asset_ids(auth_headers: Dict[str, str], max_assets: Optional[int] = None) -> List[str]:
-    """Get all asset IDs efficiently using search API."""
-    asset_ids = []
+def get_all_asset_ids(
+    client: ImmichClient,
+    search_config: Dict[str, Any],
+    max_assets: Optional[int] = None,
+    page_size: int = 200,
+) -> List[str]:
+    asset_ids: List[str] = []
     page = 1
-    
+
     print("Collecting asset IDs...")
-    
     while True:
-        # Check if we've reached the maximum number of assets
         if max_assets is not None and len(asset_ids) >= max_assets:
-            print(f"  Reached maximum asset limit: {max_assets}")
+            break
+
+        search_data = client.search_assets(page, page_size, search_config)
+        assets_data = search_data.get("assets", {}) if isinstance(search_data, dict) else {}
+        items = assets_data.get("items", [])
+
+        if not items:
+            break
+
+        page_ids = [item.get("id") for item in items if item.get("id")]
+        if max_assets is not None:
+            page_ids = page_ids[: max_assets - len(asset_ids)]
+        asset_ids.extend(page_ids)
+        print(f"  Page {page}: collected {len(page_ids)} IDs, total {len(asset_ids)}")
+
+        next_page = assets_data.get("nextPage")
+        if not next_page:
             break
         try:
-            # Search for assets - just get basic info with IDs
-            search_payload = {
-                "page": page,
-                "size": 200,  # Larger batch size for efficiency
-                "isVisible": True
-            }
-            
-            response = requests.post(
-                f"{IMMICH_API_BASE}/search/metadata",
-                headers=auth_headers,
-                json=search_payload
-            )
-            response.raise_for_status()
-            
-            search_data = response.json()
-            assets_data = search_data.get('assets', {})
-            items = assets_data.get('items', [])
-            
-            if not items:
-                break
-                
-            # Extract just the IDs
-            page_ids = [item.get('id', '') for item in items if item.get('id')]
-            
-            # Apply max_assets limit if specified
-            if max_assets is not None:
-                remaining_slots = max_assets - len(asset_ids)
-                if remaining_slots <= 0:
-                    break
-                # Only take what we need to reach the limit
-                page_ids = page_ids[:remaining_slots]
-            
-            asset_ids.extend(page_ids)
-            
-            print(f"  Page {page}: Collected {len(page_ids)} IDs, total: {len(asset_ids)}")
-            
-            # Check next page
-            next_page = assets_data.get('nextPage')
-            if not next_page:
-                print("  No more pages available")
-                break
-                
-            try:
-                page = int(next_page)
-            except (ValueError, TypeError):
-                print(f"Warning: Invalid nextPage value: {next_page}, stopping collection")
-                break
-            
-        except requests.exceptions.RequestException as e:
-            print(f"Error collecting asset IDs on page {page}: {e}")
-            break
-        except (KeyError, json.JSONDecodeError) as e:
-            print(f"Error parsing ID collection response on page {page}: {e}")
-            break
-    
-    print(f"✅ Collected {len(asset_ids)} asset IDs")
+            page = int(next_page)
+        except (TypeError, ValueError):
+            raise ImmichApiError(f"invalid search nextPage value: {next_page!r}")
+
+    print(f"Collected {len(asset_ids)} asset IDs")
     return asset_ids
 
 
-def get_asset_with_faces(auth_headers: Dict[str, str], asset_id: str) -> Optional[Dict[str, Any]]:
-    """Get detailed asset info including face data."""
-    try:
-        response = requests.get(f"{IMMICH_API_BASE}/assets/{asset_id}", 
-                              headers=auth_headers)
-        response.raise_for_status()
-        
-        return response.json()
-        
-    except requests.exceptions.RequestException as e:
-        print(f"Error getting asset {asset_id}: {e}")
+def normalize_face(face: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    bbox = {
+        "x1": as_int(face.get("boundingBoxX1")),
+        "y1": as_int(face.get("boundingBoxY1")),
+        "x2": as_int(face.get("boundingBoxX2")),
+        "y2": as_int(face.get("boundingBoxY2")),
+    }
+    if any(value is None for value in bbox.values()):
         return None
-    except (KeyError, json.JSONDecodeError) as e:
-        print(f"Error parsing asset response {asset_id}: {e}")
+
+    person = face.get("person") if isinstance(face.get("person"), dict) else {}
+    person_name = str(person.get("name") or "").strip()
+
+    return {
+        "face_id": face.get("id", ""),
+        "source_type": face.get("sourceType", ""),
+        "person_id": person.get("id", "") if person else "",
+        "person_name": person_name,
+        "image_width": as_int(face.get("imageWidth")),
+        "image_height": as_int(face.get("imageHeight")),
+        "bounding_box": bbox,
+    }
+
+
+def normalize_asset(asset: Dict[str, Any], faces: List[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized_faces = []
+    for face in faces:
+        normalized = normalize_face(face)
+        if normalized:
+            normalized_faces.append(normalized)
+    named_faces = sum(1 for face in normalized_faces if face.get("person_name"))
+
+    return {
+        "asset_id": asset.get("id", ""),
+        "original_file_name": asset.get("originalFileName", ""),
+        "original_path": asset.get("originalPath", ""),
+        "width": as_int(asset.get("width")),
+        "height": as_int(asset.get("height")),
+        "faces": normalized_faces,
+        "stats": {
+            "total_faces": len(normalized_faces),
+            "named_faces": named_faces,
+            "unnamed_faces": len(normalized_faces) - named_faces,
+        },
+    }
+
+
+def process_assets_with_faces(
+    client: ImmichClient,
+    search_config: Dict[str, Any],
+    max_assets: Optional[int] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    asset_ids = get_all_asset_ids(client, search_config, max_assets)
+    processed_assets: List[Dict[str, Any]] = []
+    stats = {
+        "assets_seen": len(asset_ids),
+        "assets_with_faces": 0,
+        "named_faces": 0,
+        "unnamed_faces": 0,
+        "skipped_assets": 0,
+        "skipped_faces": 0,
+    }
+
+    print(f"Processing {len(asset_ids)} assets for face data...")
+    for index, asset_id in enumerate(asset_ids, start=1):
+        try:
+            asset = client.get_asset(asset_id)
+            faces = client.get_faces(asset_id)
+        except ImmichApiError as exc:
+            stats["skipped_assets"] += 1
+            print(f"  Warning: skipped asset {asset_id}: {exc}")
+            continue
+
+        normalized = normalize_asset(asset, faces)
+        if normalized["faces"]:
+            processed_assets.append(normalized)
+            stats["assets_with_faces"] += 1
+            stats["named_faces"] += normalized["stats"]["named_faces"]
+            stats["unnamed_faces"] += normalized["stats"]["unnamed_faces"]
+            print(
+                "  Asset "
+                f"{stats['assets_with_faces']}: {normalized['original_file_name'] or asset_id} - "
+                f"{normalized['stats']['total_faces']} faces"
+            )
+
+        if index % 20 == 0:
+            print(f"  Progress: {index}/{len(asset_ids)} assets processed")
+
+    return processed_assets, stats
+
+
+def export_faces_to_json(
+    client: ImmichClient,
+    json_output_dir: str,
+    search_config: Dict[str, Any],
+    max_assets: Optional[int] = None,
+) -> Optional[str]:
+    output_path = Path(json_output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    processed_assets, stats = process_assets_with_faces(client, search_config, max_assets)
+    if not processed_assets:
+        print("No assets with faces found")
         return None
+
+    export_data = {
+        "schema_version": 2,
+        "exported_at": now_iso(),
+        "immich_server": client.base_url,
+        "assets": processed_assets,
+        "stats": stats,
+    }
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    json_file_path = output_path / f"immich_faces_export_{timestamp}.json"
+    with open(json_file_path, "w", encoding="utf-8") as output_handle:
+        json.dump(export_data, output_handle, indent=2, ensure_ascii=False)
+
+    print("JSON export completed")
+    print(f"  Assets with faces: {stats['assets_with_faces']}")
+    print(f"  Named faces: {stats['named_faces']}")
+    print(f"  Unnamed faces: {stats['unnamed_faces']}")
+    print(f"  JSON file: {json_file_path}")
+    return str(json_file_path)
+
+
+def legacy_people_faces(asset_data: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    for person in asset_data.get("people", []):
+        if not isinstance(person, dict):
+            continue
+        person_name = str(person.get("name") or "").strip()
+        person_id = str(person.get("id") or "")
+        for face in person.get("faces", []):
+            if not isinstance(face, dict):
+                continue
+            yield {
+                "face_id": face.get("id", ""),
+                "source_type": face.get("sourceType", ""),
+                "person_id": person_id,
+                "person_name": person_name,
+                "image_width": as_int(face.get("imageWidth")) or as_int(asset_data.get("width")),
+                "image_height": as_int(face.get("imageHeight")) or as_int(asset_data.get("height")),
+                "bounding_box": {
+                    "x1": as_int(face.get("boundingBoxX1")),
+                    "y1": as_int(face.get("boundingBoxY1")),
+                    "x2": as_int(face.get("boundingBoxX2")),
+                    "y2": as_int(face.get("boundingBoxY2")),
+                },
+            }
+
+
+def iter_asset_faces(asset_data: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
+    faces = asset_data.get("faces")
+    if isinstance(faces, list):
+        for face in faces:
+            if isinstance(face, dict):
+                yield face
+        return
+    yield from legacy_people_faces(asset_data)
+
+
+def prepare_xmp_regions(
+    asset_data: Dict[str, Any],
+    xmp_config: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    include_unnamed = bool(xmp_config.get("include_unnamed_faces", False))
+    unnamed_face_name = str(xmp_config.get("unnamed_face_name") or "Unnamed Face")
+    candidate_regions: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+    skipped_unnamed = 0
+    skipped_invalid = 0
+
+    for face in iter_asset_faces(asset_data):
+        person_name = str(face.get("person_name") or "").strip()
+        if not person_name:
+            if not include_unnamed:
+                skipped_unnamed += 1
+                continue
+            person_name = unnamed_face_name
+
+        bbox = face.get("bounding_box") if isinstance(face.get("bounding_box"), dict) else {}
+        x1 = as_int(bbox.get("x1"))
+        y1 = as_int(bbox.get("y1"))
+        x2 = as_int(bbox.get("x2"))
+        y2 = as_int(bbox.get("y2"))
+        image_width = as_int(face.get("image_width")) or as_int(asset_data.get("width"))
+        image_height = as_int(face.get("image_height")) or as_int(asset_data.get("height"))
+
+        if None in {x1, y1, x2, y2} or not image_width or not image_height:
+            skipped_invalid += 1
+            continue
+
+        box_width = x2 - x1
+        box_height = y2 - y1
+        if image_width <= 0 or image_height <= 0 or box_width <= 0 or box_height <= 0:
+            skipped_invalid += 1
+            continue
+
+        candidate_regions.append(
+            {
+                "name": person_name,
+                "dimensions": (image_width, image_height),
+                "x": clamp((x1 + box_width / 2) / image_width),
+                "y": clamp((y1 + box_height / 2) / image_height),
+                "w": clamp(box_width / image_width),
+                "h": clamp(box_height / image_height),
+            }
+        )
+
+    if not candidate_regions:
+        return [], {
+            "skipped_unnamed": skipped_unnamed,
+            "skipped_invalid": skipped_invalid,
+            "warnings": warnings,
+        }
+
+    dimension_counts = Counter(region["dimensions"] for region in candidate_regions)
+    target_dimensions = dimension_counts.most_common(1)[0][0]
+    regions = []
+    skipped_dimension_mismatch = 0
+    for region in candidate_regions:
+        if region["dimensions"] != target_dimensions:
+            skipped_dimension_mismatch += 1
+            continue
+        regions.append(region)
+
+    if skipped_dimension_mismatch:
+        warnings.append(
+            "skipped "
+            f"{skipped_dimension_mismatch} face(s) with dimensions different from "
+            f"{target_dimensions[0]}x{target_dimensions[1]}"
+        )
+
+    return regions, {
+        "dimensions": target_dimensions,
+        "skipped_unnamed": skipped_unnamed,
+        "skipped_invalid": skipped_invalid,
+        "skipped_dimension_mismatch": skipped_dimension_mismatch,
+        "warnings": warnings,
+    }
+
+
+def add_rdf_list(parent: ET.Element, property_name: str, values: List[str], bag_type: str = "Bag") -> None:
+    element = ET.SubElement(parent, property_name)
+    bag = ET.SubElement(element, qname(RDF_NS, bag_type))
+    for value in values:
+        ET.SubElement(bag, qname(RDF_NS, "li")).text = value
+
+
+def build_digikam_xmp(
+    asset_data: Dict[str, Any],
+    xmp_config: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    config = dict(DEFAULT_CONFIG["xmp"])
+    if xmp_config:
+        config.update(xmp_config)
+
+    regions, stats = prepare_xmp_regions(asset_data, config)
+    if not regions:
+        return "", stats
+
+    image_width, image_height = stats["dimensions"]
+    names = sorted({region["name"] for region in regions if region["name"]})
+    created_at = now_iso()
+
+    root = ET.Element(qname(X_NS, "xmpmeta"), {qname(X_NS, "xmptk"): "Immich Face Export Script"})
+    rdf = ET.SubElement(root, qname(RDF_NS, "RDF"))
+    description = ET.SubElement(rdf, qname(RDF_NS, "Description"), {qname(RDF_NS, "about"): ""})
+
+    ET.SubElement(description, qname(XMP_NS, "CreatorTool")).text = "Immich Face Export Script"
+    ET.SubElement(description, qname(XMP_NS, "MetadataDate")).text = created_at
+    ET.SubElement(description, qname(XMP_NS, "ModifyDate")).text = created_at
+
+    if names and config.get("write_dc_subject", True):
+        add_rdf_list(description, qname(DC_NS, "subject"), names, "Bag")
+
+    if names and config.get("write_digikam_tags", False):
+        prefix = str(config.get("people_tag_prefix") or "").strip("/")
+        tags = [f"{prefix}/{name}" if prefix else name for name in names]
+        add_rdf_list(description, qname(DIGIKAM_NS, "TagsList"), tags, "Seq")
+
+    if names and config.get("write_lightroom_hierarchical_subject", False):
+        prefix = str(config.get("people_tag_prefix") or "").strip("|")
+        tags = [f"{prefix}|{name}" if prefix else name for name in names]
+        add_rdf_list(description, qname(LR_NS, "hierarchicalSubject"), tags, "Bag")
+
+    regions_element = ET.SubElement(
+        description,
+        qname(MWG_RS_NS, "Regions"),
+        {qname(RDF_NS, "parseType"): "Resource"},
+    )
+    applied = ET.SubElement(
+        regions_element,
+        qname(MWG_RS_NS, "AppliedToDimensions"),
+        {qname(RDF_NS, "parseType"): "Resource"},
+    )
+    ET.SubElement(applied, qname(ST_DIM_NS, "w")).text = str(image_width)
+    ET.SubElement(applied, qname(ST_DIM_NS, "h")).text = str(image_height)
+    ET.SubElement(applied, qname(ST_DIM_NS, "unit")).text = "pixel"
+
+    region_list = ET.SubElement(regions_element, qname(MWG_RS_NS, "RegionList"))
+    bag = ET.SubElement(region_list, qname(RDF_NS, "Bag"))
+
+    for region in regions:
+        item = ET.SubElement(bag, qname(RDF_NS, "li"), {qname(RDF_NS, "parseType"): "Resource"})
+        ET.SubElement(item, qname(MWG_RS_NS, "Name")).text = region["name"]
+        ET.SubElement(item, qname(MWG_RS_NS, "Type")).text = "Face"
+        area = ET.SubElement(item, qname(MWG_RS_NS, "Area"), {qname(RDF_NS, "parseType"): "Resource"})
+        ET.SubElement(area, qname(ST_AREA_NS, "x")).text = f"{region['x']:.6f}"
+        ET.SubElement(area, qname(ST_AREA_NS, "y")).text = f"{region['y']:.6f}"
+        ET.SubElement(area, qname(ST_AREA_NS, "w")).text = f"{region['w']:.6f}"
+        ET.SubElement(area, qname(ST_AREA_NS, "h")).text = f"{region['h']:.6f}"
+        ET.SubElement(area, qname(ST_AREA_NS, "unit")).text = "normalized"
+
+    ET.indent(root, space=" ")
+    xml_body = ET.tostring(root, encoding="unicode", short_empty_elements=True)
+    xmp_content = f'<?xml version="1.0" encoding="UTF-8"?>\n{xml_body}\n'
+    ET.fromstring(xmp_content)
+
+    stats.update(
+        {
+            "faces_written": len(regions),
+            "people": names,
+            "image_width": image_width,
+            "image_height": image_height,
+        }
+    )
+    return xmp_content, stats
 
 
 def create_digikam_xmp_content(asset_data: Dict[str, Any]) -> str:
-    """Create DigiKam-compatible XMP content for face recognition data with EXIF information."""
-    
-    # Get people data from asset
-    people = asset_data.get('people', [])
-    exif_info = asset_data.get('exifInfo', {})
-    
-    if not people:
-        return ""
-    
-    # Extract EXIF data
-    def safe_get_exif(key, default=""):
-        return str(exif_info.get(key, default)) if exif_info.get(key) is not None else default
-    
-    # Format dates for XMP
-    def format_xmp_date(date_str):
-        if not date_str:
-            return ""
-        try:
-            # Try to parse common date formats
-            if 'T' in date_str:
-                return date_str
-            else:
-                # Add time if only date
-                return f"{date_str}T12:00:00"
-        except:
-            return date_str
-    
-    # Get camera information
-    make = safe_get_exif('make')
-    model = safe_get_exif('model')
-    lens_model = safe_get_exif('lensModel')
-    
-    # Get exposure settings
-    f_number = safe_get_exif('fNumber')
-    exposure_time = safe_get_exif('exposureTime')
-    iso = safe_get_exif('iso')
-    focal_length = safe_get_exif('focalLength')
-    
-    # Get image dimensions
-    image_width = safe_get_exif('exifImageWidth', '2160')
-    image_height = safe_get_exif('exifImageHeight', '1440')
-    
-    # Get location information
-    latitude = safe_get_exif('latitude')
-    longitude = safe_get_exif('longitude')
-    city = safe_get_exif('city')
-    state = safe_get_exif('state')
-    country = safe_get_exif('country')
-    
-    # Get dates
-    date_original = format_xmp_date(safe_get_exif('dateTimeOriginal'))
-    date_digitized = format_xmp_date(safe_get_exif('dateTimeDigitized'))
-    
-    # Get file info
-    file_name = asset_data.get('file_name', '')
-    original_path = asset_data.get('original_path', '')
-    
-    # XMP header with comprehensive namespaces
-    xmp_content = f'''<?xml version="1.0" encoding="UTF-8"?>
-<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 4.4.0">
- <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
-  <rdf:Description rdf:about=""
-   xmlns:mwg-rs="http://www.metadataworkinggroup.com/schemas/regions/"
-   xmlns:dc="http://purl.org/dc/elements/1.1/"
-   xmlns:xmp="http://ns.adobe.com/xap/1.0/"
-   xmlns:xmpMM="http://ns.adobe.com/xap/1.0/mm/"
-   xmlns:exif="http://ns.adobe.com/exif/1.0/"
-   xmlns:tiff="http://ns.adobe.com/tiff/1.0/"
-   xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/"
-   xmlns:Iptc4xmpCore="http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/"
-   xmlns:stDim="http://ns.adobe.com/xap/1.0/sType/Dimensions#"
-   xmlns:stArea="http://ns.adobe.com/xap/1.0/sType/Area#"
-   mwg-rs:Regions=""
-   xmp:ModifyDate="{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}"
-   xmp:MetadataDate="{datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}">
-'''
-    
-    # Add EXIF and TIFF information
-    if make or model:
-        xmp_content += f'''   <tiff:Make>{make}</tiff:Make>
-   <tiff:Model>{model}</tiff:Model>
-'''
-    
-    if lens_model:
-        xmp_content += f'''   <exif:LensModel>{lens_model}</exif:LensModel>
-'''
-    
-    # Add exposure settings
-    if f_number:
-        xmp_content += f'''   <exif:FNumber>{f_number}</exif:FNumber>
-'''
-    if exposure_time:
-        xmp_content += f'''   <exif:ExposureTime>{exposure_time}</exif:ExposureTime>
-'''
-    if iso:
-        xmp_content += f'''   <exif:ISOSpeedRatings>{iso}</exif:ISOSpeedRatings>
-'''
-    if focal_length:
-        xmp_content += f'''   <exif:FocalLength>{focal_length}</exif:FocalLength>
-'''
-    
-    # Add image dimensions
-    if image_width and image_height:
-        xmp_content += f'''   <tiff:ImageWidth>{image_width}</tiff:ImageWidth>
-   <tiff:ImageLength>{image_height}</tiff:ImageLength>
-   <exif:ExifImageWidth>{image_width}</exif:ExifImageWidth>
-   <exif:ExifImageHeight>{image_height}</exif:ExifImageHeight>
-'''
-    
-    # Add dates
-    if date_original:
-        xmp_content += f'''   <exif:DateTimeOriginal>{date_original}</exif:DateTimeOriginal>
-'''
-    if date_digitized:
-        xmp_content += f'''   <exif:DateTimeDigitized>{date_digitized}</exif:DateTimeDigitized>
-'''
-    
-    # Add location information
-    if latitude and longitude:
-        xmp_content += f'''   <exif:GPSLatitude>{latitude}</exif:GPSLatitude>
-   <exif:GPSLongitude>{longitude}</exif:GPSLongitude>
-'''
-    
-    # Add location names
-    if city:
-        xmp_content += f'''   <photoshop:City>{city}</photoshop:City>
-'''
-    if state:
-        xmp_content += f'''   <photoshop:State>{state}</photoshop:State>
-'''
-    if country:
-        xmp_content += f'''   <photoshop:Country>{country}</photoshop:Country>
-'''
-    
-    # Add file information
-    if file_name:
-        xmp_content += f'''   <xmp:Identifier>{file_name}</xmp:Identifier>
-'''
-    if original_path:
-        xmp_content += f'''   <xmp:BaseURL>{original_path}</xmp:BaseURL>
-'''
-    
-    # Add software and creation info
-    xmp_content += f'''   <xmp:CreatorTool>Immich Face Export Script</xmp:CreatorTool>
-'''
-    
-    # Add people tags for general compatibility
-    unique_people = set()
-    for person in people:
-        person_name = person.get('name', 'Unknown')
-        if person_name and person_name != 'Unknown':
-            unique_people.add(person_name)
-    
-    if unique_people:
-        xmp_content += '''   <dc:subject>
-    <rdf:Bag>
-'''
-        for person_name in sorted(unique_people):
-            xmp_content += f'''     <rdf:li>{person_name}</rdf:li>
-'''
-        xmp_content += '''    </rdf:Bag>
-   </dc:subject>
-'''
-    
-    # Start face regions
-    xmp_content += '''   <mwg-rs:Regions>
-    <rdf:Bag>
-'''
-    
-    # Add face regions from people data
-    for person in people:
-        person_name = person.get('name', 'Unknown')
-        for face in person.get('faces', []):
-            # Convert bounding box to XMP format (normalized coordinates)
-            x1 = face.get('boundingBoxX1', 0)
-            y1 = face.get('boundingBoxY1', 0)
-            x2 = face.get('boundingBoxX2', 0)
-            y2 = face.get('boundingBoxY2', 0)
-            
-            # Calculate center and dimensions
-            width = x2 - x1
-            height = y2 - y1
-            center_x = x1 + width / 2
-            center_y = y1 + height / 2
-            
-            # Get image dimensions for normalization
-            exif_info = asset_data.get('exifInfo', {})
-            image_width = int(exif_info.get('exifImageWidth', 2160))
-            image_height = int(exif_info.get('exifImageHeight', 1440))
-            
-            # Normalize coordinates (0-1 range)
-            norm_x = center_x / image_width if image_width > 0 else 0
-            norm_y = center_y / image_height if image_height > 0 else 0
-            norm_w = width / image_width if image_width > 0 else 0
-            norm_h = height / image_height if image_height > 0 else 0
-            
-            # XMP region format
-            region_xml = f'''     <rdf:li>
-      <rdf:Description
-       mwg-rs:Name="{person_name}"
-       mwg-rs:Type="Face"
-       mwg-rs:Extensions="">
-       <mwg-rs:Area
-        stArea:x="{norm_x:.6f}"
-        stArea:y="{norm_y:.6f}"
-        stArea:w="{norm_w:.6f}"
-        stArea:h="{norm_h:.6f}"
-        stArea:unit="normalized"/>
-      </rdf:Description>
-     </rdf:li>
-'''
-            xmp_content += region_xml
-    
-    # XMP footer
-    xmp_content += '''    </rdf:Bag>
-   </mwg-rs:Regions>
-  </rdf:Description>
- </rdf:RDF>
-</x:xmpmeta>
-'''
-    
-    return xmp_content
+    """Backward-compatible wrapper for callers that only need the XMP string."""
+    return build_digikam_xmp(asset_data)[0]
 
 
-def save_xmp_sidecar(original_path: str, xmp_content: str, output_dir: str = "") -> bool:
-    """Save XMP content to sidecar file, creating same directory structure in output_dir."""
+def sidecar_filename(original_path: str, sidecar_naming: str) -> str:
+    original = Path(original_path)
+    if sidecar_naming == "replace-extension":
+        return f"{original.stem}.xmp"
+    return f"{original.name}.xmp"
+
+
+def output_sidecar_path(original_path: str, output_dir: str, sidecar_naming: str) -> Path:
+    filename = sidecar_filename(original_path, sidecar_naming)
+    original = Path(original_path)
+    output_base = Path(output_dir)
+
+    if not original_path:
+        return output_base / filename
+
+    parts = original.parts
+    if len(parts) > 2:
+        relative_dir = Path(*parts[1:-1])
+        return output_base / relative_dir / filename
+    return output_base / filename
+
+
+def save_xmp_sidecar(
+    original_path: str,
+    xmp_content: str,
+    output_dir: str,
+    sidecar_naming: str = "extension-xmp",
+    write_next_to_original: bool = False,
+) -> Optional[Path]:
     if not xmp_content.strip():
-        return False  # Skip empty XMP
-        
-    try:
-        # Create sidecar filename (same name with original extension + .xmp)
-        original_path_obj = Path(original_path)
-        filename = original_path_obj.name + '.xmp'
-        
-        if output_dir:
-            output_base = Path(output_dir)
-            
-            # Extract relative path from original path
-            # For: /myphoto/2025-09/yuhuan/file.jpg -> relative: 2025-09/yuhuan/file.xmp
-            original_parts = original_path_obj.parts
-            
-            # Build relative directory structure (skip root like '/myphoto')
-            if len(original_parts) > 2:  # Has subdirectories
-                # Take all parts after the root directory
-                relative_parts = original_parts[1:-1]  # Skip root and filename
-                if relative_parts:
-                    relative_dir = Path(*relative_parts)
-                    xmp_path = output_base / relative_dir / filename
-                else:
-                    xmp_path = output_base / filename
-            else:
-                # Just filename, no subdirectories
-                xmp_path = output_base / filename
-            
-            # Ensure the parent directories exist
-            xmp_path.parent.mkdir(parents=True, exist_ok=True)
-        else:
-            # If no output directory, use current directory
-            xmp_path = Path(filename)
-        
-        with open(xmp_path, 'w', encoding='utf-8') as f:
-            f.write(xmp_content)
-        
-        print(f"    Saved XMP sidecar: {xmp_path}")
-        return True
-        
-    except IOError as e:
-        print(f"    Error saving XMP file: {e}")
-        return False
+        return None
+
+    if write_next_to_original:
+        target_path = Path(original_path).with_name(sidecar_filename(original_path, sidecar_naming))
+    else:
+        target_path = output_sidecar_path(original_path, output_dir, sidecar_naming)
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(target_path, "w", encoding="utf-8") as output_handle:
+        output_handle.write(xmp_content)
+
+    return target_path
 
 
-def process_assets_with_faces(auth_headers: Dict[str, str], max_assets: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Process assets and collect those with face recognition data."""
-    processed_assets = []
-    
-    print("Step 1: Collecting asset IDs...")
-    asset_ids = get_all_asset_ids(auth_headers, max_assets)
-    
-    if not asset_ids:
-        print("No asset IDs collected")
-        return processed_assets
-    
-    print(f"\nStep 2: Processing {len(asset_ids)} assets for face data...")
-    
-    # Apply max_assets limit to processing loop as well
-    if max_assets is not None:
-        asset_ids = asset_ids[:max_assets]
-        print(f"  Limited to processing {len(asset_ids)} assets (max_assets limit)")
-    
-    # Process assets one by one to avoid hardcoded batch limits
-    total_with_faces = 0
-    
-    for i, asset_id in enumerate(asset_ids):
-        detailed_asset = get_asset_with_faces(auth_headers, asset_id)
-        
-        if detailed_asset:
-            people = detailed_asset.get('people', [])
-            
-            if people and len(people) > 0:
-                # Count total faces
-                total_faces = sum(len(person.get('faces', [])) for person in people)
-                
-                file_name = detailed_asset.get('originalFileName', 'Unknown')
-                print(f"    Asset {total_with_faces+1}: {file_name} - {len(people)} people, {total_faces} faces")
-                
-                # Prepare asset info
-                asset_info = {
-                    'asset_id': asset_id,
-                    'original_path': detailed_asset.get('originalPath', ''),
-                    'file_name': file_name,
-                    'exifInfo': detailed_asset.get('exifInfo', {}),
-                    'people': people  # Include people data directly in asset
-                }
-                
-                processed_assets.append(asset_info)
-                
-                total_with_faces += 1
-        
-        # Progress update every 20 assets
-        if (i + 1) % 20 == 0:
-            print(f"    Progress: {i+1}/{len(asset_ids)} assets processed")
-    
-    print(f"\n✅ Processing completed: Found {total_with_faces} assets with faces")
-    return processed_assets
+def asset_original_path(asset_data: Dict[str, Any]) -> str:
+    return str(
+        asset_data.get("original_path")
+        or asset_data.get("originalPath")
+        or asset_data.get("original_file_name")
+        or asset_data.get("file_name")
+        or f"unknown_{asset_data.get('asset_id', 'asset')}.jpg"
+    )
 
 
-def export_faces_to_json(auth_headers: Dict[str, str], json_output_dir: str = "json_exports", max_assets: Optional[int] = None) -> Optional[str]:
-    """Export face recognition data to JSON file (Stage 1)."""
-    print("Starting face recognition export to JSON format (Stage 1)...")
-    
-    # Create output directory
-    output_path = Path(json_output_dir)
-    output_path.mkdir(exist_ok=True)
-    
-    # Process assets with faces
-    processed_assets = process_assets_with_faces(auth_headers, max_assets)
-    
+def export_faces_to_digikam_xmp_from_json(
+    json_file_path: str,
+    output_dir: str,
+    xmp_config: Optional[Dict[str, Any]] = None,
+    write_next_to_original: bool = False,
+) -> bool:
+    with open(json_file_path, "r", encoding="utf-8") as input_handle:
+        export_data = json.load(input_handle)
+
+    processed_assets = export_data.get("assets", [])
     if not processed_assets:
-        print("No assets with faces found")
-        return None
-    
-    # Create comprehensive JSON export
-    export_data = {
-        'export_timestamp': datetime.now().isoformat(),
-        'immich_server': IMMICH_BASE_URL,
-        'total_assets': len(processed_assets),
-        'assets': processed_assets
-    }
-    
-    # Generate filename with timestamp
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    json_filename = f"immich_faces_export_{timestamp}.json"
-    json_file_path = output_path / json_filename
-    
-    try:
-        with open(json_file_path, 'w', encoding='utf-8') as f:
-            json.dump(export_data, f, indent=2, ensure_ascii=False)
-        
-        print(f"✅ JSON export completed!")
-        print(f"📊 Statistics:")
-        print(f"   Total assets with faces: {len(processed_assets)}")
-        print(f"   JSON file: {json_file_path}")
-        
-        return str(json_file_path)
-        
-    except IOError as e:
-        print(f"❌ Error saving JSON file: {e}")
-        return None
-
-
-def export_faces_to_digikam_xmp_from_json(json_file_path: str, output_dir: str = "xmp_sidecars") -> bool:
-    """Export face recognition data to DigiKam XMP format from JSON file (Stage 2)."""
-    print(f"Starting face recognition export to DigiKam XMP format from JSON file (Stage 2)...")
-    print(f"JSON source: {json_file_path}")
-    
-    try:
-        # Load JSON data
-        with open(json_file_path, 'r', encoding='utf-8') as f:
-            export_data = json.load(f)
-        
-        processed_assets = export_data.get('assets', [])
-        
-        if not processed_assets:
-            print("No assets found in JSON file")
-            return False
-        
-        print(f"Loaded {len(processed_assets)} assets from JSON file")
-        
-    except (IOError, json.JSONDecodeError) as e:
-        print(f"❌ Error loading JSON file: {e}")
+        print("No assets found in JSON file")
         return False
-    
-    # Create output directory
-    output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
-    
+
+    config = dict(DEFAULT_CONFIG["xmp"])
+    if xmp_config:
+        config.update(xmp_config)
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     total_files_created = 0
-    total_faces_processed = 0
-    person_stats = {}
-    
-    print(f"\nCreating XMP files for {len(processed_assets)} assets with faces...")
-    
-    for i, asset_data in enumerate(processed_assets):
-        people_data = asset_data.get('people', [])
-        
-        if people_data:
-            # Create XMP content
-            xmp_content = create_digikam_xmp_content(asset_data)
-            
-            if xmp_content.strip():  # Only proceed if XMP content is not empty
-                # Save XMP sidecar file
-                original_path = asset_data.get('original_path', f"unknown_{asset_data['asset_id']}.jpg")
-                if save_xmp_sidecar(original_path, xmp_content, str(output_path)):
-                    total_files_created += 1
-                    total_faces_processed += sum(len(person.get('faces', [])) for person in people_data)
-                    
-                    # Update person statistics
-                    for person in people_data:
-                        person_name = person.get('name', 'Unknown')
-                        if person_name not in person_stats:
-                            person_stats[person_name] = 0
-                        person_stats[person_name] += len(person.get('faces', []))
-                    
-                    if (i + 1) % 5 == 0:  # Progress update every 5 files
-                        print(f"    Progress: {i+1}/{len(processed_assets)} XMP files created")
-            else:
-                print(f"    Warning: Empty XMP content for asset {asset_data.get('file_name', 'Unknown')}")
-        else:
-            print(f"    Warning: No people data for asset {asset_data.get('file_name', 'Unknown')}")
-    
-    # Create summary file
-    summary_file = output_path / "export_summary.json"
+    total_faces_written = 0
+    total_unnamed_skipped = 0
+    total_invalid_skipped = 0
+    people_stats: Dict[str, int] = {}
+    warnings: List[str] = []
+
+    print(f"Creating XMP files for {len(processed_assets)} assets...")
+    for index, asset_data in enumerate(processed_assets, start=1):
+        xmp_content, stats = build_digikam_xmp(asset_data, config)
+        total_unnamed_skipped += int(stats.get("skipped_unnamed", 0))
+        total_invalid_skipped += int(stats.get("skipped_invalid", 0))
+        warnings.extend(str(warning) for warning in stats.get("warnings", []))
+
+        if not xmp_content:
+            continue
+
+        original_path = asset_original_path(asset_data)
+        target_path = save_xmp_sidecar(
+            original_path,
+            xmp_content,
+            output_dir,
+            sidecar_naming=str(config.get("sidecar_naming", "extension-xmp")),
+            write_next_to_original=write_next_to_original,
+        )
+        if not target_path:
+            continue
+
+        total_files_created += 1
+        total_faces_written += int(stats.get("faces_written", 0))
+        for person in stats.get("people", []):
+            people_stats[person] = people_stats.get(person, 0) + 1
+
+        print(f"  Saved XMP sidecar: {target_path}")
+        if index % 20 == 0:
+            print(f"  Progress: {index}/{len(processed_assets)} assets")
+
+    summary_file = Path(output_dir) / "export_summary.json"
     summary_data = {
-        'export_timestamp': datetime.now().isoformat(),
-        'json_source': json_file_path,
-        'total_assets': len(processed_assets),
-        'total_xmp_files_created': total_files_created,
-        'total_faces_processed': total_faces_processed,
-        'people_statistics': person_stats,
-        'output_directory': str(output_path.absolute())
+        "exported_at": now_iso(),
+        "json_source": json_file_path,
+        "total_assets": len(processed_assets),
+        "total_xmp_files_created": total_files_created,
+        "total_faces_written": total_faces_written,
+        "total_unnamed_faces_skipped": total_unnamed_skipped,
+        "total_invalid_faces_skipped": total_invalid_skipped,
+        "people_statistics": people_stats,
+        "warnings": warnings,
+        "output_directory": str(Path(output_dir).absolute()),
+        "sidecar_naming": config.get("sidecar_naming", "extension-xmp"),
+        "write_next_to_original": write_next_to_original,
     }
-    
-    try:
-        with open(summary_file, 'w', encoding='utf-8') as f:
-            json.dump(summary_data, f, indent=2, ensure_ascii=False)
-    except IOError as e:
-        print(f"Error saving summary file: {e}")
-    
-    print(f"\n✅ DigiKam XMP export completed!")
-    print(f"📊 Statistics:")
-    print(f"   Total assets processed: {len(processed_assets)}")
-    print(f"   XMP sidecar files created: {total_files_created}")
-    print(f"   Total faces processed: {total_faces_processed}")
-    print(f"   Unique people: {len(person_stats)}")
-    print(f"   Output directory: {output_path.absolute()}")
-    print(f"   Summary file: {summary_file}")
-    
-    # Print person statistics
-    if person_stats:
-        print(f"\n👥 People found:")
-        for person, count in sorted(person_stats.items(), key=lambda x: x[1], reverse=True)[:20]:  # Top 20
-            print(f"   {person}: {count} faces")
-    
-    return True
+    with open(summary_file, "w", encoding="utf-8") as summary_handle:
+        json.dump(summary_data, summary_handle, indent=2, ensure_ascii=False)
+
+    print("XMP export completed")
+    print(f"  XMP sidecar files created: {total_files_created}")
+    print(f"  Faces written: {total_faces_written}")
+    print(f"  Unnamed faces skipped: {total_unnamed_skipped}")
+    print(f"  Invalid faces skipped: {total_invalid_skipped}")
+    print(f"  Summary file: {summary_file}")
+
+    return total_files_created > 0
 
 
-def export_faces_to_digikam_xmp(auth_headers: Dict[str, str], output_dir: str = "xmp_sidecars", max_assets: Optional[int] = None) -> bool:
-    """Export face recognition data to DigiKam XMP sidecar files."""
-    print("Starting face recognition export to DigiKam XMP format...")
-    
-    # Create output directory
-    output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
-    
-    # Process assets with faces
-    processed_assets = process_assets_with_faces(auth_headers, max_assets)
-    
+def export_faces_to_digikam_xmp(
+    client: ImmichClient,
+    output_dir: str,
+    search_config: Dict[str, Any],
+    xmp_config: Dict[str, Any],
+    max_assets: Optional[int] = None,
+    write_next_to_original: bool = False,
+) -> bool:
+    processed_assets, stats = process_assets_with_faces(client, search_config, max_assets)
     if not processed_assets:
         print("No assets with faces found")
         return False
-    
-    total_files_created = 0
-    total_faces_processed = 0
-    person_stats = {}
-    
-    print(f"\nCreating XMP files for {len(processed_assets)} assets with faces...")
-    
-    for i, asset_data in enumerate(processed_assets):
-        people_data = asset_data.get('people', [])
-        
-        if people_data:
-            # Create XMP content
-            xmp_content = create_digikam_xmp_content(asset_data)
-            
-            if xmp_content.strip():  # Only proceed if XMP content is not empty
-                # Save XMP sidecar file
-                original_path = asset_data.get('original_path', f"unknown_{asset_data['asset_id']}.jpg")
-                if save_xmp_sidecar(original_path, xmp_content, str(output_path)):
-                    total_files_created += 1
-                    total_faces_processed += sum(len(person.get('faces', [])) for person in people_data)
-                    
-                    # Update person statistics
-                    for person in people_data:
-                        person_name = person.get('name', 'Unknown')
-                        if person_name not in person_stats:
-                            person_stats[person_name] = 0
-                        person_stats[person_name] += len(person.get('faces', []))
-                    
-                    if (i + 1) % 5 == 0:  # Progress update every 5 files
-                        print(f"    Progress: {i+1}/{len(processed_assets)} XMP files created")
-            else:
-                print(f"    Warning: Empty XMP content for asset {asset_data.get('file_name', 'Unknown')}")
-        else:
-            print(f"    Warning: No people data for asset {asset_data.get('file_name', 'Unknown')}")
-    
-    # Create summary file
-    summary_file = output_path / "export_summary.json"
-    summary_data = {
-        'export_timestamp': datetime.now().isoformat(),
-        'total_assets': len(processed_assets),
-        'total_xmp_files_created': total_files_created,
-        'total_faces_processed': total_faces_processed,
-        'people_statistics': person_stats,
-        'output_directory': str(output_path.absolute())
+
+    temp_export = {
+        "schema_version": 2,
+        "exported_at": now_iso(),
+        "immich_server": client.base_url,
+        "assets": processed_assets,
+        "stats": stats,
     }
-    
-    try:
-        with open(summary_file, 'w', encoding='utf-8') as f:
-            json.dump(summary_data, f, indent=2, ensure_ascii=False)
-    except IOError as e:
-        print(f"Error saving summary file: {e}")
-    
-    print(f"\n✅ DigiKam XMP export completed!")
-    print(f"📊 Statistics:")
-    print(f"   Total assets processed: {len(processed_assets)}")
-    print(f"   XMP sidecar files created: {total_files_created}")
-    print(f"   Total faces processed: {total_faces_processed}")
-    print(f"   Unique people: {len(person_stats)}")
-    print(f"   Output directory: {output_path.absolute()}")
-    print(f"   Summary file: {summary_file}")
-    
-    # Print person statistics
-    if person_stats:
-        print(f"\n👥 People found:")
-        for person, count in sorted(person_stats.items(), key=lambda x: x[1], reverse=True)[:20]:  # Top 20
-            print(f"   {person}: {count} faces")
-    
-    return True
+    temp_json = Path(output_dir) / "latest_in_memory_export.json"
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    with open(temp_json, "w", encoding="utf-8") as temp_handle:
+        json.dump(temp_export, temp_handle, indent=2, ensure_ascii=False)
+    return export_faces_to_digikam_xmp_from_json(str(temp_json), output_dir, xmp_config, write_next_to_original)
 
 
-def parse_arguments():
-    """Parse command line arguments."""
+def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description='Export face recognition data from Immich to DigiKam XMP format',
+        description="Export face recognition data from Immich to JSON and DigiKam/Immich-readable XMP sidecars",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
+        epilog="""
 Examples:
-  # Run both stages (default): Export to JSON then generate XMP
   python export_face.py
-  
-  # Run only Stage 1: Export to JSON file
   python export_face.py --stage1-only
-  
-  # Run only Stage 2: Generate XMP from existing JSON file
-  python export_face.py --stage2-only --json-file path/to/export.json
-  
-  # Specify custom output directories
-  python export_face.py --json-dir my_json_exports --xmp-dir my_xmp_files
-        '''
+  python export_face.py --stage2-only --json-file json_exports/immich_faces_export.json
+  python export_face.py --max-assets 50
+  python export_face.py --include-unnamed-faces
+  python export_face.py --write-next-to-original
+        """,
     )
-    
+    parser.add_argument("--stage1-only", action="store_true", help="export Immich face data to JSON only")
+    parser.add_argument("--stage2-only", action="store_true", help="generate XMP files from an existing JSON export")
+    parser.add_argument("--json-file", type=str, help="JSON file for --stage2-only")
+    parser.add_argument("--json-dir", type=str, default=None, help="directory for JSON exports")
+    parser.add_argument("--xmp-dir", type=str, default=None, help="directory for XMP output")
+    parser.add_argument("--max-assets", type=int, default=None, help="maximum number of assets to scan")
     parser.add_argument(
-        '--stage1-only', 
-        action='store_true',
-        help='Run only Stage 1: Export face data to JSON file'
+        "--include-unnamed-faces",
+        action="store_true",
+        help="write unnamed faces using xmp.unnamed_face_name; off by default to avoid fake people",
     )
-    
     parser.add_argument(
-        '--stage2-only',
-        action='store_true', 
-        help='Run only Stage 2: Generate XMP files from existing JSON file'
-    )
-    
-    parser.add_argument(
-        '--json-file',
-        type=str,
-        help='Path to JSON file for Stage 2 (required with --stage2-only)'
-    )
-    
-    parser.add_argument(
-        '--json-dir',
-        type=str,
+        "--sidecar-naming",
+        choices=["extension-xmp", "replace-extension"],
         default=None,
-        help='Directory for JSON exports (default: from config)'
+        help="extension-xmp writes photo.jpg.xmp; replace-extension writes photo.xmp",
     )
-    
+    parser.add_argument("--write-digikam-tags", action="store_true", help="write digiKam:TagsList people tags")
     parser.add_argument(
-        '--xmp-dir',
-        type=str,
-        default=None,
-        help='Directory for XMP output (default: from config)'
+        "--write-lightroom-hierarchical-subject",
+        action="store_true",
+        help="write lr:hierarchicalSubject people tags",
     )
-    
     parser.add_argument(
-        '--max-assets',
-        type=int,
-        default=None,
-        help='Maximum number of assets to process (for debugging)'
+        "--write-next-to-original",
+        action="store_true",
+        help="write XMP next to originalPath so Immich can detect it directly",
     )
-    
+    parser.add_argument("--config", default="config.json", help="configuration file path")
     return parser.parse_args()
 
 
-def main():
-    """Main function to export face recognition data with two-stage processing."""
+def apply_cli_overrides(args: argparse.Namespace, xmp_config: Dict[str, Any]) -> Dict[str, Any]:
+    config = dict(xmp_config)
+    if args.include_unnamed_faces:
+        config["include_unnamed_faces"] = True
+    if args.sidecar_naming:
+        config["sidecar_naming"] = args.sidecar_naming
+    if args.write_digikam_tags:
+        config["write_digikam_tags"] = True
+    if args.write_lightroom_hierarchical_subject:
+        config["write_lightroom_hierarchical_subject"] = True
+    return config
+
+
+def build_client_from_config(config: ConfigLoader) -> ImmichClient:
+    immich = config.get_immich_config()
+    settings = config.get_settings_config()
+    return ImmichClient(
+        base_url=immich["base_url"],
+        api_key=immich["api_key"],
+        email=immich["email"],
+        password=immich["password"],
+        request_timeout=settings["request_timeout"],
+        retry_attempts=settings["retry_attempts"],
+        retry_backoff_seconds=settings["retry_backoff_seconds"],
+    )
+
+
+def main() -> int:
     args = parse_arguments()
-    
-    # Validate argument combinations
+
     if args.stage1_only and args.stage2_only:
-        print("❌ Error: Cannot specify both --stage1-only and --stage2-only")
-        return
-    
+        print("Error: cannot specify both --stage1-only and --stage2-only")
+        return 2
+
     if args.stage2_only and not args.json_file:
-        print("❌ Error: --json-file is required when using --stage2-only")
-        return
-    
-    # Print configuration summary
+        print("Error: --json-file is required with --stage2-only")
+        return 2
+
+    config = ConfigLoader(args.config)
     config.print_config_summary()
-    
-    # Stage 2 only mode - no need for Immich authentication
-    if args.stage2_only:
-        print("Running Stage 2 only: Generate XMP from JSON file")
-        
-        # Use custom XMP directory if specified, otherwise use config
-        xmp_dir = args.xmp_dir or config.get_output_config()['digikam_xmp_dir']
-        
-        success = export_faces_to_digikam_xmp_from_json(args.json_file, xmp_dir)
-        
-        if success:
-            print(f"\n🎉 XMP files generated successfully from JSON!")
-            print(f"   Check the '{xmp_dir}' directory for XMP sidecar files.")
-        else:
-            print("\n❌ Failed to generate XMP files from JSON")
-        return
-    
-    # Stage 1 or both stages - need Immich authentication
-    if not config.validate_immich_config():
-        return
-    
-    # Get configuration
-    immich_config = config.get_immich_config()
-    auth_headers = create_auth_headers(immich_config)
+
     output_config = config.get_output_config()
-    
-    # Use custom directories if specified, otherwise use config
-    json_dir = args.json_dir or output_config['json_export_dir']
-    xmp_dir = args.xmp_dir or output_config['digikam_xmp_dir']
-    
-    print("Starting Immich face recognition export...")
-    print(f"Server: {IMMICH_BASE_URL}")
-    print(f"JSON output directory: {json_dir}")
-    print(f"XMP output directory: {xmp_dir}")
-    if args.max_assets:
-        print(f"Maximum assets to process: {args.max_assets}")
-    
-    # Step 1: Build authentication headers
-    if not auth_headers:
-        print("❌ Authentication failed. Please check your API key or fallback credentials.")
-        return
-    
-    if immich_config['api_key']:
-        print("✅ Using API key authentication")
-    else:
-        print("✅ Authentication successful via email/password fallback")
-    
-    # Stage 1: Export to JSON
-    json_file_path = export_faces_to_json(auth_headers, json_dir, args.max_assets)
-    
+    xmp_config = apply_cli_overrides(args, config.get_xmp_config())
+    search_config = config.get_search_config()
+    json_dir = args.json_dir or output_config["json_export_dir"]
+    xmp_dir = args.xmp_dir or output_config["digikam_xmp_dir"]
+
+    if args.stage2_only:
+        success = export_faces_to_digikam_xmp_from_json(
+            args.json_file,
+            xmp_dir,
+            xmp_config,
+            write_next_to_original=args.write_next_to_original,
+        )
+        return 0 if success else 1
+
+    if not config.validate_immich_config():
+        return 2
+
+    client = build_client_from_config(config)
+    try:
+        client.authenticate()
+    except ImmichApiError as exc:
+        print(f"Authentication failed: {exc}")
+        return 1
+
+    print("Starting Immich face export")
+    print(f"  JSON output directory: {json_dir}")
+    print(f"  XMP output directory: {xmp_dir}")
+    if args.write_next_to_original:
+        print("  XMP write mode: next to original files")
+
+    json_file_path = export_faces_to_json(client, json_dir, search_config, args.max_assets)
     if not json_file_path:
-        print("❌ Failed to export face data to JSON")
-        return
-    
+        return 1
+
     if args.stage1_only:
-        print(f"\n🎉 Stage 1 completed successfully!")
-        print(f"   JSON file created: {json_file_path}")
-        print(f"   Use this file with --stage2-only --json-file to generate XMP files later.")
-        return
-    
-    # Stage 2: Generate XMP from JSON
-    print(f"\nProceeding to Stage 2: Generate XMP files from JSON...")
-    success = export_faces_to_digikam_xmp_from_json(json_file_path, xmp_dir)
-    
-    if success:
-        print(f"\n🎉 Both stages completed successfully!")
-        print(f"   JSON export: {json_file_path}")
-        print(f"   XMP files: {xmp_dir}")
-    else:
-        print("\n❌ Failed to generate XMP files from JSON")
+        return 0
+
+    success = export_faces_to_digikam_xmp_from_json(
+        json_file_path,
+        xmp_dir,
+        xmp_config,
+        write_next_to_original=args.write_next_to_original,
+    )
+    return 0 if success else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

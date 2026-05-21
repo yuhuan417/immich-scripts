@@ -44,7 +44,7 @@ pip install requests
 cp config.json.template config.json
 
 # Edit configuration file
-ano config.json
+nano config.json
 ```
 
 Fill in your Immich server information in `config.json`:
@@ -58,11 +58,26 @@ Fill in your Immich server information in `config.json`:
   },
   "settings": {
     "request_timeout": 30,
-    "retry_attempts": 3
+    "retry_attempts": 3,
+    "retry_backoff_seconds": 1
   },
   "output": {
     "digikam_xmp_dir": "digikam_xmp_sidecars",
     "json_export_dir": "json_exports"
+  },
+  "xmp": {
+    "sidecar_naming": "extension-xmp",
+    "include_unnamed_faces": false,
+    "unnamed_face_name": "Unnamed Face",
+    "write_dc_subject": true,
+    "write_digikam_tags": false,
+    "write_lightroom_hierarchical_subject": false,
+    "people_tag_prefix": "People"
+  },
+  "search": {
+    "asset_type": "IMAGE",
+    "visibility": "timeline",
+    "with_people": true
   }
 }
 ```
@@ -97,19 +112,25 @@ python export_face.py --max-assets 50
 # Specify custom output directories
 python export_face.py --json-dir my_json_exports --xmp-dir my_xmp_files
 
+# Write sidecars beside the original files so Immich can detect them directly
+python export_face.py --stage2-only --json-file path/to/export.json --write-next-to-original
+
+# Include unnamed faces with a placeholder name (disabled by default)
+python export_face.py --include-unnamed-faces
+
 # Combine multiple options
 python export_face.py --stage1-only --max-assets 100 --json-dir test_output
 ```
 
 ## 📖 Detailed Documentation
 
-For complete project documentation, please refer to [IFLOW.md](IFLOW.md), which includes:
+For the export design and compatibility plan, please refer to [DESIGN.md](DESIGN.md), which includes:
 
-- 🔧 Complete configuration instructions
-- 🛠️ Development guide
-- 🔍 Troubleshooting
-- 🛡️ Security best practices
-- 📋 Detailed feature descriptions
+- 🔧 Immich API compatibility notes
+- 🛠️ DigiKam/MWG XMP design
+- 🔍 XML safety requirements
+- 🛡️ Export validation plan
+- 📋 Implementation migration steps
 
 ## 📁 Output Structure
 
@@ -133,6 +154,8 @@ digikam_xmp_sidecars/
     └── photo4.jpg.xmp
 ```
 
+Immich detects sidecars at `originalPath + ".xmp"` first, for example `IMG_0001.jpg.xmp`, then falls back to `IMG_0001.xmp`. The default `extension-xmp` naming is chosen to match that preferred Immich and DigiKam sidecar form. Use `--write-next-to-original` only when the machine running the script can safely write to the original photo library path.
+
 ## 🎯 Use Cases
 
 - **📸 Photo Management Migration** - Maintain face recognition data when migrating from Immich to DigiKam
@@ -152,25 +175,37 @@ digikam_xmp_sidecars/
 | `immich.password` | `IMMICH_PASSWORD` | - | Login password (fallback only) |
 | `settings.request_timeout` | `IMMICH_REQUEST_TIMEOUT` | 30 | API request timeout (seconds) |
 | `settings.retry_attempts` | `IMMICH_RETRY_ATTEMPTS` | 3 | Number of retry attempts |
+| `settings.retry_backoff_seconds` | `IMMICH_RETRY_BACKOFF_SECONDS` | 1 | Base retry backoff in seconds |
 | `output.digikam_xmp_dir` | `OUTPUT_DIGIKAM_XMP_DIR` | digikam_xmp_sidecars | XMP output directory |
 | `output.json_export_dir` | `OUTPUT_JSON_EXPORT_DIR` | json_exports | JSON export directory |
+| `xmp.sidecar_naming` | `XMP_SIDECAR_NAMING` | extension-xmp | `extension-xmp` or `replace-extension` |
+| `xmp.include_unnamed_faces` | `XMP_INCLUDE_UNNAMED_FACES` | false | Export unnamed faces with a placeholder |
+| `xmp.write_dc_subject` | `XMP_WRITE_DC_SUBJECT` | true | Write person names as XMP subjects |
+| `xmp.write_digikam_tags` | `XMP_WRITE_DIGIKAM_TAGS` | false | Write `digiKam:TagsList` people tags |
+| `xmp.write_lightroom_hierarchical_subject` | `XMP_WRITE_LIGHTROOM_HIERARCHICAL_SUBJECT` | false | Write `lr:hierarchicalSubject` people tags |
+| `xmp.people_tag_prefix` | `XMP_PEOPLE_TAG_PREFIX` | People | Prefix used for optional hierarchical people tags |
+| `search.asset_type` | `IMMICH_SEARCH_ASSET_TYPE` | IMAGE | Asset type sent to Immich metadata search |
+| `search.visibility` | `IMMICH_SEARCH_VISIBILITY` | timeline | Asset visibility sent to Immich metadata search |
 
 ## 🛠️ Development
 
 ### Code Checking
 ```bash
 # Syntax check
-python -m py_compile export_face.py
+python3 -m py_compile export_face.py
 
 # Import test
-python -c "from export_face import ConfigLoader; print('OK')"
+python3 -c "from export_face import ConfigLoader; print('OK')"
+
+# Unit tests
+python3 -m unittest
 ```
 
 ### Configuration Testing
 ```bash
 # Test environment variable configuration
 export IMMICH_API_KEY="test-api-key"
-python -c "from export_face import ConfigLoader; config = ConfigLoader(); print('Config OK')"
+python3 -c "from export_face import ConfigLoader; config = ConfigLoader(); print('Config OK')"
 ```
 
 ## 🐛 Common Issues
@@ -179,7 +214,7 @@ python -c "from export_face import ConfigLoader; config = ConfigLoader(); print(
 **A:** Check if the server address and API key are correct, and ensure the server is accessible. If you use the legacy fallback flow, also verify email and password.
 
 ### Q: No XMP files generated?
-**A:** Confirm that your photos have been processed for face recognition in Immich. Only photos containing face data will generate XMP files.
+**A:** Confirm that your photos have face metadata in Immich and at least one named person. Unnamed faces are skipped by default because Immich ignores unnamed sidecar regions during face import.
 
 ### Q: Output directory permission error?
 **A:** Ensure the script has permission to create and write to the configured output directory.
