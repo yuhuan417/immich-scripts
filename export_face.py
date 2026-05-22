@@ -43,6 +43,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "include_unnamed_faces": False,
         "unnamed_face_name": "Unnamed Face",
         "write_dc_subject": True,
+        "write_asset_tags": True,
+        "write_asset_tags_to_dc_subject": True,
+        "write_asset_metadata": True,
         "write_digikam_tags": False,
         "write_lightroom_hierarchical_subject": False,
         "people_tag_prefix": "People",
@@ -67,6 +70,9 @@ ENV_MAPPINGS = {
     "XMP_SIDECAR_NAMING": ("xmp", "sidecar_naming"),
     "XMP_INCLUDE_UNNAMED_FACES": ("xmp", "include_unnamed_faces"),
     "XMP_WRITE_DC_SUBJECT": ("xmp", "write_dc_subject"),
+    "XMP_WRITE_ASSET_TAGS": ("xmp", "write_asset_tags"),
+    "XMP_WRITE_ASSET_TAGS_TO_DC_SUBJECT": ("xmp", "write_asset_tags_to_dc_subject"),
+    "XMP_WRITE_ASSET_METADATA": ("xmp", "write_asset_metadata"),
     "XMP_WRITE_DIGIKAM_TAGS": ("xmp", "write_digikam_tags"),
     "XMP_WRITE_LIGHTROOM_HIERARCHICAL_SUBJECT": ("xmp", "write_lightroom_hierarchical_subject"),
     "XMP_PEOPLE_TAG_PREFIX": ("xmp", "people_tag_prefix"),
@@ -78,6 +84,9 @@ RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
 X_NS = "adobe:ns:meta/"
 XMP_NS = "http://ns.adobe.com/xap/1.0/"
 DC_NS = "http://purl.org/dc/elements/1.1/"
+EXIF_NS = "http://ns.adobe.com/exif/1.0/"
+TIFF_NS = "http://ns.adobe.com/tiff/1.0/"
+PHOTOSHOP_NS = "http://ns.adobe.com/photoshop/1.0/"
 MWG_RS_NS = "http://www.metadataworkinggroup.com/schemas/regions/"
 ST_DIM_NS = "http://ns.adobe.com/xap/1.0/sType/Dimensions#"
 ST_AREA_NS = "http://ns.adobe.com/xmp/sType/Area#"
@@ -89,6 +98,9 @@ for prefix, uri in [
     ("rdf", RDF_NS),
     ("xmp", XMP_NS),
     ("dc", DC_NS),
+    ("exif", EXIF_NS),
+    ("tiff", TIFF_NS),
+    ("photoshop", PHOTOSHOP_NS),
     ("mwg-rs", MWG_RS_NS),
     ("stDim", ST_DIM_NS),
     ("stArea", ST_AREA_NS),
@@ -196,6 +208,9 @@ class ConfigLoader:
             "include_unnamed_faces": bool(self.get("xmp.include_unnamed_faces", False)),
             "unnamed_face_name": str(self.get("xmp.unnamed_face_name", "Unnamed Face")),
             "write_dc_subject": bool(self.get("xmp.write_dc_subject", True)),
+            "write_asset_tags": bool(self.get("xmp.write_asset_tags", True)),
+            "write_asset_tags_to_dc_subject": bool(self.get("xmp.write_asset_tags_to_dc_subject", True)),
+            "write_asset_metadata": bool(self.get("xmp.write_asset_metadata", True)),
             "write_digikam_tags": bool(self.get("xmp.write_digikam_tags", False)),
             "write_lightroom_hierarchical_subject": bool(
                 self.get("xmp.write_lightroom_hierarchical_subject", False)
@@ -243,6 +258,8 @@ class ConfigLoader:
         print(f"  Timeout: {settings['request_timeout']}s")
         print(f"  Retry attempts: {settings['retry_attempts']}")
         print(f"  Sidecar naming: {xmp['sidecar_naming']}")
+        print(f"  Write asset tags: {xmp['write_asset_tags']}")
+        print(f"  Write asset metadata: {xmp['write_asset_metadata']}")
 
 
 class ImmichApiError(RuntimeError):
@@ -377,6 +394,39 @@ def clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
     return max(lower, min(upper, value))
 
 
+def ordered_unique(values: Iterable[str]) -> List[str]:
+    seen = set()
+    result = []
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    return str(value)
+
+
+def clean_mapping(data: Dict[str, Any]) -> Dict[str, Any]:
+    cleaned = {}
+    for key, value in data.items():
+        if value is None or value == "":
+            continue
+        if isinstance(value, (list, dict)) and not value:
+            continue
+        cleaned[key] = json_safe(value)
+    return cleaned
+
+
 def get_all_asset_ids(
     client: ImmichClient,
     search_config: Dict[str, Any],
@@ -440,6 +490,110 @@ def normalize_face(face: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def normalize_tag_value(tag: Any) -> str:
+    if isinstance(tag, str):
+        return tag.strip()
+    if isinstance(tag, dict):
+        for key in ("value", "name", "tag", "title", "label"):
+            value = tag.get(key)
+            if value:
+                return str(value).strip()
+    return ""
+
+
+def normalize_tag_details(tags: Any) -> List[Dict[str, Any]]:
+    if not isinstance(tags, list):
+        return []
+
+    normalized = []
+    seen_values = set()
+    for tag in tags:
+        value = normalize_tag_value(tag)
+        if not value or value in seen_values:
+            continue
+        seen_values.add(value)
+
+        if isinstance(tag, dict):
+            detail = clean_mapping(
+                {
+                    "id": tag.get("id"),
+                    "name": tag.get("name"),
+                    "value": tag.get("value") or value,
+                    "parent_id": tag.get("parentId") or tag.get("parent_id"),
+                    "color": tag.get("color"),
+                    "created_at": tag.get("createdAt"),
+                    "updated_at": tag.get("updatedAt"),
+                }
+            )
+        else:
+            detail = {"value": value}
+        normalized.append(detail)
+    return normalized
+
+
+def extract_asset_tag_details(asset: Dict[str, Any]) -> List[Dict[str, Any]]:
+    candidates = []
+    top_level_tags = asset.get("tags")
+    if isinstance(top_level_tags, list):
+        candidates.extend(top_level_tags)
+
+    exif_info = asset.get("exifInfo") if isinstance(asset.get("exifInfo"), dict) else {}
+    exif_tags = exif_info.get("tags")
+    if isinstance(exif_tags, list):
+        candidates.extend(exif_tags)
+
+    return normalize_tag_details(candidates)
+
+
+def tag_values_from_details(tag_details: Iterable[Dict[str, Any]]) -> List[str]:
+    return ordered_unique(str(tag.get("value") or tag.get("name") or "") for tag in tag_details)
+
+
+def normalize_person(person: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(person, dict):
+        return None
+
+    person_id = str(person.get("id") or "").strip()
+    person_name = str(person.get("name") or "").strip()
+    if not person_id and not person_name:
+        return None
+
+    return clean_mapping(
+        {
+            "person_id": person_id,
+            "person_name": person_name,
+            "birth_date": person.get("birthDate"),
+            "is_hidden": person.get("isHidden"),
+            "is_favorite": person.get("isFavorite"),
+            "thumbnail_path": person.get("thumbnailPath"),
+            "updated_at": person.get("updatedAt"),
+        }
+    )
+
+
+def merge_person_index(people: Dict[str, Dict[str, Any]], person_data: Optional[Dict[str, Any]]) -> None:
+    if not person_data:
+        return
+    key = str(person_data.get("person_id") or person_data.get("person_name") or "").strip()
+    if not key:
+        return
+
+    current = people.setdefault(key, {})
+    for field, value in person_data.items():
+        if field not in current or current[field] is None or current[field] == "":
+            current[field] = value
+
+
+def people_index_to_list(people: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(
+        people.values(),
+        key=lambda person: (
+            str(person.get("person_name") or "").lower(),
+            str(person.get("person_id") or ""),
+        ),
+    )
+
+
 def normalize_asset(asset: Dict[str, Any], faces: List[Dict[str, Any]]) -> Dict[str, Any]:
     normalized_faces = []
     for face in faces:
@@ -447,6 +601,9 @@ def normalize_asset(asset: Dict[str, Any], faces: List[Dict[str, Any]]) -> Dict[
         if normalized:
             normalized_faces.append(normalized)
     named_faces = sum(1 for face in normalized_faces if face.get("person_name"))
+    tag_details = extract_asset_tag_details(asset)
+    tags = tag_values_from_details(tag_details)
+    exif_info = asset.get("exifInfo") if isinstance(asset.get("exifInfo"), dict) else {}
 
     return {
         "asset_id": asset.get("id", ""),
@@ -454,11 +611,18 @@ def normalize_asset(asset: Dict[str, Any], faces: List[Dict[str, Any]]) -> Dict[
         "original_path": asset.get("originalPath", ""),
         "width": as_int(asset.get("width")),
         "height": as_int(asset.get("height")),
+        "tags": tags,
+        "tag_details": tag_details,
+        "asset_metadata": {
+            "exif_info": clean_mapping(exif_info),
+        },
         "faces": normalized_faces,
         "stats": {
             "total_faces": len(normalized_faces),
             "named_faces": named_faces,
             "unnamed_faces": len(normalized_faces) - named_faces,
+            "total_tags": len(tags),
+            "skipped_faces": max(0, len(faces) - len(normalized_faces)),
         },
     }
 
@@ -467,14 +631,19 @@ def process_assets_with_faces(
     client: ImmichClient,
     search_config: Dict[str, Any],
     max_assets: Optional[int] = None,
-) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, int], List[Dict[str, Any]]]:
     asset_ids = get_all_asset_ids(client, search_config, max_assets)
     processed_assets: List[Dict[str, Any]] = []
+    people: Dict[str, Dict[str, Any]] = {}
     stats = {
         "assets_seen": len(asset_ids),
+        "assets_exported": 0,
         "assets_with_faces": 0,
+        "assets_with_tags": 0,
         "named_faces": 0,
         "unnamed_faces": 0,
+        "asset_tags": 0,
+        "people": 0,
         "skipped_assets": 0,
         "skipped_faces": 0,
     }
@@ -489,9 +658,16 @@ def process_assets_with_faces(
             print(f"  Warning: skipped asset {asset_id}: {exc}")
             continue
 
+        for face in faces:
+            merge_person_index(people, normalize_person(face.get("person")))
+
         normalized = normalize_asset(asset, faces)
-        if normalized["faces"]:
+        stats["skipped_faces"] += normalized["stats"]["skipped_faces"]
+        if normalized["faces"] or normalized["tags"]:
             processed_assets.append(normalized)
+            stats["assets_exported"] += 1
+
+        if normalized["faces"]:
             stats["assets_with_faces"] += 1
             stats["named_faces"] += normalized["stats"]["named_faces"]
             stats["unnamed_faces"] += normalized["stats"]["unnamed_faces"]
@@ -501,10 +677,16 @@ def process_assets_with_faces(
                 f"{normalized['stats']['total_faces']} faces"
             )
 
+        if normalized["tags"]:
+            stats["assets_with_tags"] += 1
+            stats["asset_tags"] += len(normalized["tags"])
+
         if index % 20 == 0:
             print(f"  Progress: {index}/{len(asset_ids)} assets processed")
 
-    return processed_assets, stats
+    people_list = people_index_to_list(people)
+    stats["people"] = len(people_list)
+    return processed_assets, stats, people_list
 
 
 def export_faces_to_json(
@@ -516,15 +698,16 @@ def export_faces_to_json(
     output_path = Path(json_output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    processed_assets, stats = process_assets_with_faces(client, search_config, max_assets)
+    processed_assets, stats, people = process_assets_with_faces(client, search_config, max_assets)
     if not processed_assets:
-        print("No assets with faces found")
+        print("No assets with faces or tags found")
         return None
 
     export_data = {
-        "schema_version": 2,
+        "schema_version": 3,
         "exported_at": now_iso(),
         "immich_server": client.base_url,
+        "people": people,
         "assets": processed_assets,
         "stats": stats,
     }
@@ -535,9 +718,12 @@ def export_faces_to_json(
         json.dump(export_data, output_handle, indent=2, ensure_ascii=False)
 
     print("JSON export completed")
+    print(f"  Assets exported: {stats['assets_exported']}")
     print(f"  Assets with faces: {stats['assets_with_faces']}")
+    print(f"  Assets with tags: {stats['assets_with_tags']}")
     print(f"  Named faces: {stats['named_faces']}")
     print(f"  Unnamed faces: {stats['unnamed_faces']}")
+    print(f"  People indexed: {stats['people']}")
     print(f"  JSON file: {json_file_path}")
     return str(json_file_path)
 
@@ -575,6 +761,38 @@ def iter_asset_faces(asset_data: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
                 yield face
         return
     yield from legacy_people_faces(asset_data)
+
+
+def asset_tag_values(asset_data: Dict[str, Any]) -> List[str]:
+    direct_tags = asset_data.get("tags")
+    if isinstance(direct_tags, list):
+        values = ordered_unique(normalize_tag_value(tag) for tag in direct_tags)
+        if values:
+            return values
+
+    tag_details = asset_data.get("tag_details")
+    if isinstance(tag_details, list):
+        values = tag_values_from_details(tag for tag in tag_details if isinstance(tag, dict))
+        if values:
+            return values
+
+    exif_info = asset_exif_info(asset_data)
+    return tag_values_from_details(normalize_tag_details(exif_info.get("tags")))
+
+
+def xmp_hierarchical_tag(value: str) -> str:
+    return str(value).strip().replace("/", "|")
+
+
+def asset_exif_info(asset_data: Dict[str, Any]) -> Dict[str, Any]:
+    asset_metadata = asset_data.get("asset_metadata")
+    if isinstance(asset_metadata, dict) and isinstance(asset_metadata.get("exif_info"), dict):
+        return asset_metadata["exif_info"]
+    if isinstance(asset_data.get("exif_info"), dict):
+        return asset_data["exif_info"]
+    if isinstance(asset_data.get("exifInfo"), dict):
+        return asset_data["exifInfo"]
+    return {}
 
 
 def prepare_xmp_regions(
@@ -659,10 +877,68 @@ def prepare_xmp_regions(
 
 
 def add_rdf_list(parent: ET.Element, property_name: str, values: List[str], bag_type: str = "Bag") -> None:
+    if not values:
+        return
     element = ET.SubElement(parent, property_name)
     bag = ET.SubElement(element, qname(RDF_NS, bag_type))
     for value in values:
         ET.SubElement(bag, qname(RDF_NS, "li")).text = value
+
+
+def add_rdf_alt(parent: ET.Element, property_name: str, value: str) -> None:
+    if not value:
+        return
+    element = ET.SubElement(parent, property_name)
+    alt = ET.SubElement(element, qname(RDF_NS, "Alt"))
+    ET.SubElement(alt, qname(RDF_NS, "li"), {"{http://www.w3.org/XML/1998/namespace}lang": "x-default"}).text = value
+
+
+def add_text(parent: ET.Element, property_name: str, value: Any) -> bool:
+    if value is None or value == "":
+        return False
+    ET.SubElement(parent, property_name).text = str(value)
+    return True
+
+
+def add_asset_metadata(description: ET.Element, asset_data: Dict[str, Any]) -> int:
+    exif_info = asset_exif_info(asset_data)
+    if not exif_info:
+        return 0
+
+    written = 0
+    written += int(add_text(description, qname(TIFF_NS, "Make"), exif_info.get("make")))
+    written += int(add_text(description, qname(TIFF_NS, "Model"), exif_info.get("model")))
+    written += int(add_text(description, qname(EXIF_NS, "LensModel"), exif_info.get("lensModel")))
+    written += int(add_text(description, qname(EXIF_NS, "FNumber"), exif_info.get("fNumber")))
+    written += int(add_text(description, qname(EXIF_NS, "ExposureTime"), exif_info.get("exposureTime")))
+    written += int(add_text(description, qname(EXIF_NS, "ISOSpeedRatings"), exif_info.get("iso")))
+    written += int(add_text(description, qname(EXIF_NS, "FocalLength"), exif_info.get("focalLength")))
+
+    width = exif_info.get("exifImageWidth") or asset_data.get("width")
+    height = exif_info.get("exifImageHeight") or asset_data.get("height")
+    written += int(add_text(description, qname(TIFF_NS, "ImageWidth"), width))
+    written += int(add_text(description, qname(TIFF_NS, "ImageLength"), height))
+    written += int(add_text(description, qname(EXIF_NS, "ExifImageWidth"), width))
+    written += int(add_text(description, qname(EXIF_NS, "ExifImageHeight"), height))
+
+    date_original = exif_info.get("dateTimeOriginal")
+    written += int(add_text(description, qname(EXIF_NS, "DateTimeOriginal"), date_original))
+    written += int(add_text(description, qname(PHOTOSHOP_NS, "DateCreated"), date_original))
+    written += int(add_text(description, qname(XMP_NS, "Rating"), exif_info.get("rating")))
+
+    written += int(add_text(description, qname(EXIF_NS, "GPSLatitude"), exif_info.get("latitude")))
+    written += int(add_text(description, qname(EXIF_NS, "GPSLongitude"), exif_info.get("longitude")))
+    written += int(add_text(description, qname(PHOTOSHOP_NS, "City"), exif_info.get("city")))
+    written += int(add_text(description, qname(PHOTOSHOP_NS, "State"), exif_info.get("state")))
+    written += int(add_text(description, qname(PHOTOSHOP_NS, "Country"), exif_info.get("country")))
+
+    description_text = exif_info.get("description")
+    if description_text:
+        add_rdf_alt(description, qname(DC_NS, "description"), str(description_text))
+        written += 1
+        written += int(add_text(description, qname(TIFF_NS, "ImageDescription"), description_text))
+
+    return written
 
 
 def build_digikam_xmp(
@@ -674,11 +950,37 @@ def build_digikam_xmp(
         config.update(xmp_config)
 
     regions, stats = prepare_xmp_regions(asset_data, config)
-    if not regions:
+    asset_tags = asset_tag_values(asset_data)
+    names = sorted({region["name"] for region in regions if region["name"]})
+    subject_values = []
+    if config.get("write_dc_subject", True):
+        subject_values.extend(names)
+    if config.get("write_asset_tags_to_dc_subject", True):
+        subject_values.extend(asset_tags)
+    subject_values = ordered_unique(subject_values)
+
+    digikam_tags = []
+    if config.get("write_asset_tags", True):
+        digikam_tags.extend(asset_tags)
+    if names and config.get("write_digikam_tags", False):
+        prefix = str(config.get("people_tag_prefix") or "").strip("/")
+        digikam_tags.extend(f"{prefix}/{name}" if prefix else name for name in names)
+    digikam_tags = ordered_unique(digikam_tags)
+
+    lightroom_tags = []
+    if config.get("write_asset_tags", True) and config.get("write_lightroom_hierarchical_subject", False):
+        lightroom_tags.extend(xmp_hierarchical_tag(tag) for tag in asset_tags)
+    if names and config.get("write_lightroom_hierarchical_subject", False):
+        prefix = str(config.get("people_tag_prefix") or "").strip("|")
+        lightroom_tags.extend(f"{prefix}|{name}" if prefix else name for name in names)
+    lightroom_tags = ordered_unique(lightroom_tags)
+
+    exif_info = asset_exif_info(asset_data)
+    should_write_metadata = bool(config.get("write_asset_metadata", True) and exif_info)
+
+    if not regions and not subject_values and not digikam_tags and not lightroom_tags and not should_write_metadata:
         return "", stats
 
-    image_width, image_height = stats["dimensions"]
-    names = sorted({region["name"] for region in regions if region["name"]})
     created_at = now_iso()
 
     root = ET.Element(qname(X_NS, "xmpmeta"), {qname(X_NS, "xmptk"): "Immich Face Export Script"})
@@ -689,46 +991,43 @@ def build_digikam_xmp(
     ET.SubElement(description, qname(XMP_NS, "MetadataDate")).text = created_at
     ET.SubElement(description, qname(XMP_NS, "ModifyDate")).text = created_at
 
-    if names and config.get("write_dc_subject", True):
-        add_rdf_list(description, qname(DC_NS, "subject"), names, "Bag")
+    metadata_fields_written = 0
+    if should_write_metadata:
+        metadata_fields_written = add_asset_metadata(description, asset_data)
 
-    if names and config.get("write_digikam_tags", False):
-        prefix = str(config.get("people_tag_prefix") or "").strip("/")
-        tags = [f"{prefix}/{name}" if prefix else name for name in names]
-        add_rdf_list(description, qname(DIGIKAM_NS, "TagsList"), tags, "Seq")
+    add_rdf_list(description, qname(DC_NS, "subject"), subject_values, "Bag")
+    add_rdf_list(description, qname(DIGIKAM_NS, "TagsList"), digikam_tags, "Seq")
+    add_rdf_list(description, qname(LR_NS, "hierarchicalSubject"), lightroom_tags, "Bag")
 
-    if names and config.get("write_lightroom_hierarchical_subject", False):
-        prefix = str(config.get("people_tag_prefix") or "").strip("|")
-        tags = [f"{prefix}|{name}" if prefix else name for name in names]
-        add_rdf_list(description, qname(LR_NS, "hierarchicalSubject"), tags, "Bag")
+    if regions:
+        image_width, image_height = stats["dimensions"]
+        regions_element = ET.SubElement(
+            description,
+            qname(MWG_RS_NS, "Regions"),
+            {qname(RDF_NS, "parseType"): "Resource"},
+        )
+        applied = ET.SubElement(
+            regions_element,
+            qname(MWG_RS_NS, "AppliedToDimensions"),
+            {qname(RDF_NS, "parseType"): "Resource"},
+        )
+        ET.SubElement(applied, qname(ST_DIM_NS, "w")).text = str(image_width)
+        ET.SubElement(applied, qname(ST_DIM_NS, "h")).text = str(image_height)
+        ET.SubElement(applied, qname(ST_DIM_NS, "unit")).text = "pixel"
 
-    regions_element = ET.SubElement(
-        description,
-        qname(MWG_RS_NS, "Regions"),
-        {qname(RDF_NS, "parseType"): "Resource"},
-    )
-    applied = ET.SubElement(
-        regions_element,
-        qname(MWG_RS_NS, "AppliedToDimensions"),
-        {qname(RDF_NS, "parseType"): "Resource"},
-    )
-    ET.SubElement(applied, qname(ST_DIM_NS, "w")).text = str(image_width)
-    ET.SubElement(applied, qname(ST_DIM_NS, "h")).text = str(image_height)
-    ET.SubElement(applied, qname(ST_DIM_NS, "unit")).text = "pixel"
+        region_list = ET.SubElement(regions_element, qname(MWG_RS_NS, "RegionList"))
+        bag = ET.SubElement(region_list, qname(RDF_NS, "Bag"))
 
-    region_list = ET.SubElement(regions_element, qname(MWG_RS_NS, "RegionList"))
-    bag = ET.SubElement(region_list, qname(RDF_NS, "Bag"))
-
-    for region in regions:
-        item = ET.SubElement(bag, qname(RDF_NS, "li"), {qname(RDF_NS, "parseType"): "Resource"})
-        ET.SubElement(item, qname(MWG_RS_NS, "Name")).text = region["name"]
-        ET.SubElement(item, qname(MWG_RS_NS, "Type")).text = "Face"
-        area = ET.SubElement(item, qname(MWG_RS_NS, "Area"), {qname(RDF_NS, "parseType"): "Resource"})
-        ET.SubElement(area, qname(ST_AREA_NS, "x")).text = f"{region['x']:.6f}"
-        ET.SubElement(area, qname(ST_AREA_NS, "y")).text = f"{region['y']:.6f}"
-        ET.SubElement(area, qname(ST_AREA_NS, "w")).text = f"{region['w']:.6f}"
-        ET.SubElement(area, qname(ST_AREA_NS, "h")).text = f"{region['h']:.6f}"
-        ET.SubElement(area, qname(ST_AREA_NS, "unit")).text = "normalized"
+        for region in regions:
+            item = ET.SubElement(bag, qname(RDF_NS, "li"), {qname(RDF_NS, "parseType"): "Resource"})
+            ET.SubElement(item, qname(MWG_RS_NS, "Name")).text = region["name"]
+            ET.SubElement(item, qname(MWG_RS_NS, "Type")).text = "Face"
+            area = ET.SubElement(item, qname(MWG_RS_NS, "Area"), {qname(RDF_NS, "parseType"): "Resource"})
+            ET.SubElement(area, qname(ST_AREA_NS, "x")).text = f"{region['x']:.6f}"
+            ET.SubElement(area, qname(ST_AREA_NS, "y")).text = f"{region['y']:.6f}"
+            ET.SubElement(area, qname(ST_AREA_NS, "w")).text = f"{region['w']:.6f}"
+            ET.SubElement(area, qname(ST_AREA_NS, "h")).text = f"{region['h']:.6f}"
+            ET.SubElement(area, qname(ST_AREA_NS, "unit")).text = "normalized"
 
     ET.indent(root, space=" ")
     xml_body = ET.tostring(root, encoding="unicode", short_empty_elements=True)
@@ -739,10 +1038,25 @@ def build_digikam_xmp(
         {
             "faces_written": len(regions),
             "people": names,
-            "image_width": image_width,
-            "image_height": image_height,
+            "asset_tags": asset_tags,
+            "asset_tags_written": len(asset_tags)
+            if (
+                config.get("write_asset_tags", True)
+                or config.get("write_asset_tags_to_dc_subject", True)
+                or (
+                    config.get("write_asset_tags", True)
+                    and config.get("write_lightroom_hierarchical_subject", False)
+                )
+            )
+            else 0,
+            "digikam_tags": digikam_tags,
+            "lightroom_tags": lightroom_tags,
+            "subjects": subject_values,
+            "metadata_fields_written": metadata_fields_written,
         }
     )
+    if regions:
+        stats.update({"image_width": image_width, "image_height": image_height})
     return xmp_content, stats
 
 
@@ -828,7 +1142,10 @@ def export_faces_to_digikam_xmp_from_json(
     total_faces_written = 0
     total_unnamed_skipped = 0
     total_invalid_skipped = 0
+    total_asset_tags_written = 0
+    total_metadata_fields_written = 0
     people_stats: Dict[str, int] = {}
+    tag_stats: Dict[str, int] = {}
     warnings: List[str] = []
 
     print(f"Creating XMP files for {len(processed_assets)} assets...")
@@ -836,6 +1153,8 @@ def export_faces_to_digikam_xmp_from_json(
         xmp_content, stats = build_digikam_xmp(asset_data, config)
         total_unnamed_skipped += int(stats.get("skipped_unnamed", 0))
         total_invalid_skipped += int(stats.get("skipped_invalid", 0))
+        total_asset_tags_written += int(stats.get("asset_tags_written", 0))
+        total_metadata_fields_written += int(stats.get("metadata_fields_written", 0))
         warnings.extend(str(warning) for warning in stats.get("warnings", []))
 
         if not xmp_content:
@@ -856,6 +1175,8 @@ def export_faces_to_digikam_xmp_from_json(
         total_faces_written += int(stats.get("faces_written", 0))
         for person in stats.get("people", []):
             people_stats[person] = people_stats.get(person, 0) + 1
+        for tag in stats.get("asset_tags", []):
+            tag_stats[tag] = tag_stats.get(tag, 0) + 1
 
         print(f"  Saved XMP sidecar: {target_path}")
         if index % 20 == 0:
@@ -870,7 +1191,10 @@ def export_faces_to_digikam_xmp_from_json(
         "total_faces_written": total_faces_written,
         "total_unnamed_faces_skipped": total_unnamed_skipped,
         "total_invalid_faces_skipped": total_invalid_skipped,
+        "total_asset_tags_written": total_asset_tags_written,
+        "total_metadata_fields_written": total_metadata_fields_written,
         "people_statistics": people_stats,
+        "tag_statistics": tag_stats,
         "warnings": warnings,
         "output_directory": str(Path(output_dir).absolute()),
         "sidecar_naming": config.get("sidecar_naming", "extension-xmp"),
@@ -882,6 +1206,8 @@ def export_faces_to_digikam_xmp_from_json(
     print("XMP export completed")
     print(f"  XMP sidecar files created: {total_files_created}")
     print(f"  Faces written: {total_faces_written}")
+    print(f"  Asset tags written: {total_asset_tags_written}")
+    print(f"  Metadata fields written: {total_metadata_fields_written}")
     print(f"  Unnamed faces skipped: {total_unnamed_skipped}")
     print(f"  Invalid faces skipped: {total_invalid_skipped}")
     print(f"  Summary file: {summary_file}")
@@ -897,15 +1223,16 @@ def export_faces_to_digikam_xmp(
     max_assets: Optional[int] = None,
     write_next_to_original: bool = False,
 ) -> bool:
-    processed_assets, stats = process_assets_with_faces(client, search_config, max_assets)
+    processed_assets, stats, people = process_assets_with_faces(client, search_config, max_assets)
     if not processed_assets:
-        print("No assets with faces found")
+        print("No assets with faces or tags found")
         return False
 
     temp_export = {
-        "schema_version": 2,
+        "schema_version": 3,
         "exported_at": now_iso(),
         "immich_server": client.base_url,
+        "people": people,
         "assets": processed_assets,
         "stats": stats,
     }
@@ -949,6 +1276,21 @@ Examples:
     )
     parser.add_argument("--write-digikam-tags", action="store_true", help="write digiKam:TagsList people tags")
     parser.add_argument(
+        "--no-asset-tags",
+        action="store_true",
+        help="do not write Immich asset tags to digiKam:TagsList",
+    )
+    parser.add_argument(
+        "--no-asset-tags-in-dc-subject",
+        action="store_true",
+        help="do not mirror Immich asset tags into dc:subject keywords",
+    )
+    parser.add_argument(
+        "--no-asset-metadata",
+        action="store_true",
+        help="do not write exported EXIF/location/rating metadata fields into XMP",
+    )
+    parser.add_argument(
         "--write-lightroom-hierarchical-subject",
         action="store_true",
         help="write lr:hierarchicalSubject people tags",
@@ -970,6 +1312,12 @@ def apply_cli_overrides(args: argparse.Namespace, xmp_config: Dict[str, Any]) ->
         config["sidecar_naming"] = args.sidecar_naming
     if args.write_digikam_tags:
         config["write_digikam_tags"] = True
+    if args.no_asset_tags:
+        config["write_asset_tags"] = False
+    if args.no_asset_tags_in_dc_subject:
+        config["write_asset_tags_to_dc_subject"] = False
+    if args.no_asset_metadata:
+        config["write_asset_metadata"] = False
     if args.write_lightroom_hierarchical_subject:
         config["write_lightroom_hierarchical_subject"] = True
     return config

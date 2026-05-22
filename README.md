@@ -14,6 +14,8 @@ A Python tool to export face recognition data from Immich photo management syste
 ## 🌟 Features
 
 - **🔍 Face Recognition Data Export** - Retrieve complete face recognition data from Immich API
+- **🏷️ Immich Tag Backup** - Preserve ordinary Immich asset tags and write them to Immich-readable XMP
+- **🧾 Metadata Backup** - Preserve asset EXIF/location/rating metadata in the JSON export and companion XMP
 - **📁 Directory Structure Preservation** - Output files maintain original photo directory structure
 - **🎯 DigiKam Compatible** - Generate standard XMP sidecar files, fully compatible with DigiKam
 - **⚙️ Flexible Configuration** - Support JSON configuration files and environment variables
@@ -70,6 +72,9 @@ Fill in your Immich server information in `config.json`:
     "include_unnamed_faces": false,
     "unnamed_face_name": "Unnamed Face",
     "write_dc_subject": true,
+    "write_asset_tags": true,
+    "write_asset_tags_to_dc_subject": true,
+    "write_asset_metadata": true,
     "write_digikam_tags": false,
     "write_lightroom_hierarchical_subject": false,
     "people_tag_prefix": "People"
@@ -118,6 +123,9 @@ python export_face.py --stage2-only --json-file path/to/export.json --write-next
 # Include unnamed faces with a placeholder name (disabled by default)
 python export_face.py --include-unnamed-faces
 
+# Generate XMP without ordinary Immich tags or EXIF/location metadata
+python export_face.py --stage2-only --json-file path/to/export.json --no-asset-tags --no-asset-metadata
+
 # Combine multiple options
 python export_face.py --stage1-only --max-assets 100 --json-dir test_output
 ```
@@ -139,9 +147,11 @@ After running the script, the following will be generated in the configured outp
 ### JSON Export (Stage 1)
 ```
 json_exports/
-├── immich_faces_export_20251013_143022.json  # Complete face data export
+├── immich_faces_export_20251013_143022.json  # Face, tag, person, and metadata backup
 └── ...
 ```
+
+The current export schema is `schema_version: 3`. Each exported asset contains normalized face boxes, ordinary Immich asset tags, selected asset metadata under `asset_metadata.exif_info`, and a top-level `people` index preserves person-level Immich fields such as hidden/favorite state when the API returns them. Assets are exported when they have faces or ordinary tags.
 
 ### XMP Files (Stage 2)
 ```
@@ -155,6 +165,8 @@ digikam_xmp_sidecars/
 ```
 
 Immich detects sidecars at `originalPath + ".xmp"` first, for example `IMG_0001.jpg.xmp`, then falls back to `IMG_0001.xmp`. The default `extension-xmp` naming is chosen to match that preferred Immich and DigiKam sidecar form. Use `--write-next-to-original` only when the machine running the script can safely write to the original photo library path.
+
+Ordinary Immich asset tags are written to `digiKam:TagsList` by default because Immich reads that field from XMP sidecars. They are also mirrored into `dc:subject` by default for broader keyword search compatibility. Person names remain in MWG face regions and `dc:subject`; use `--write-digikam-tags` only if you also want person names added to `digiKam:TagsList` with the configured `people_tag_prefix`.
 
 ## 🎯 Use Cases
 
@@ -181,7 +193,10 @@ Immich detects sidecars at `originalPath + ".xmp"` first, for example `IMG_0001.
 | `xmp.sidecar_naming` | `XMP_SIDECAR_NAMING` | extension-xmp | `extension-xmp` or `replace-extension` |
 | `xmp.include_unnamed_faces` | `XMP_INCLUDE_UNNAMED_FACES` | false | Export unnamed faces with a placeholder |
 | `xmp.write_dc_subject` | `XMP_WRITE_DC_SUBJECT` | true | Write person names as XMP subjects |
-| `xmp.write_digikam_tags` | `XMP_WRITE_DIGIKAM_TAGS` | false | Write `digiKam:TagsList` people tags |
+| `xmp.write_asset_tags` | `XMP_WRITE_ASSET_TAGS` | true | Write ordinary Immich asset tags to `digiKam:TagsList` |
+| `xmp.write_asset_tags_to_dc_subject` | `XMP_WRITE_ASSET_TAGS_TO_DC_SUBJECT` | true | Mirror ordinary Immich tags into `dc:subject` |
+| `xmp.write_asset_metadata` | `XMP_WRITE_ASSET_METADATA` | true | Write exported EXIF/location/rating metadata fields into XMP |
+| `xmp.write_digikam_tags` | `XMP_WRITE_DIGIKAM_TAGS` | false | Also write person names as `digiKam:TagsList` people tags |
 | `xmp.write_lightroom_hierarchical_subject` | `XMP_WRITE_LIGHTROOM_HIERARCHICAL_SUBJECT` | false | Write `lr:hierarchicalSubject` people tags |
 | `xmp.people_tag_prefix` | `XMP_PEOPLE_TAG_PREFIX` | People | Prefix used for optional hierarchical people tags |
 | `search.asset_type` | `IMMICH_SEARCH_ASSET_TYPE` | IMAGE | Asset type sent to Immich metadata search |

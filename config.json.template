@@ -19,6 +19,9 @@
     "include_unnamed_faces": false,
     "unnamed_face_name": "Unnamed Face",
     "write_dc_subject": true,
+    "write_asset_tags": true,
+    "write_asset_tags_to_dc_subject": true,
+    "write_asset_metadata": true,
     "write_digikam_tags": false,
     "write_lightroom_hierarchical_subject": false,
     "people_tag_prefix": "People"

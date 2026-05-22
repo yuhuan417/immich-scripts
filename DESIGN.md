@@ -11,7 +11,7 @@ Success criteria:
 - Read image assets and their face bounding boxes from Immich.
 - Convert Immich face coordinates into MWG Image Region Metadata.
 - Generate valid XML even when names, paths, or camera metadata contain special characters.
-- Produce face regions and people tags that DigiKam can read reliably.
+- Produce face regions, people keywords, ordinary Immich asset tags, and selected asset metadata that DigiKam and Immich can read reliably.
 - Keep sidecar naming, output layout, errors, and progress reporting predictable.
 
 Non-goals:
@@ -19,7 +19,7 @@ Non-goals:
 - Do not import DigiKam data back into Immich.
 - Do not modify original photo files by default.
 - Do not run face recognition.
-- Do not rewrite full EXIF metadata unless a separate requirement is added.
+- Do not treat the XMP output as a byte-for-byte replacement for every metadata field in the original media file.
 
 ## Reference Baseline
 
@@ -37,6 +37,8 @@ Immich changes quickly. The implementation should avoid relying on old response 
 ## Confirmed Immich Sidecar Import Behavior
 
 Current Immich source reads sidecars through exiftool and merges sidecar tags over media-file tags during metadata extraction. For face import, it checks for `RegionInfo.AppliedToDimensions` and a non-empty `RegionInfo.RegionList`. Each region must have a `Name`; unnamed regions are skipped. Imported sidecar faces are written with Immich source type `Exif`, and Immich converts normalized MWG area coordinates back to pixel boxes using `AppliedToDimensions.W` and `AppliedToDimensions.H`.
+
+For ordinary asset tags, Immich writes and reads XMP sidecar tags through `digiKam:TagsList`. Lightroom-style hierarchical subjects and IPTC keywords are fallback-compatible in Immich, but `digiKam:TagsList` is the primary field this exporter targets. The exporter also mirrors asset tags into `dc:subject` for general keyword search compatibility.
 
 Immich sidecar discovery uses this order:
 
@@ -258,25 +260,26 @@ Make the people tag prefix configurable:
 
 Example tags could be `People/John Smith` or `People|John Smith`. The best separator should be confirmed with DigiKam before enabling this by default.
 
-### 8. Do Not Rewrite EXIF/TIFF In The First Fix
+### 8. Preserve Asset Tags And Selected Metadata
 
-The current implementation writes camera, lens, exposure, GPS, and date fields into XMP. That creates extra risk:
+GitHub issue #1 requested a more complete companion sidecar: remaining EXIF fields from the JSON export, ordinary Immich tags, full sidecar filenames, and people names as searchable tags. The corrected implementation should keep a stable face schema while also preserving metadata needed to rebuild useful companion sidecars.
 
-- Some fields have strict XMP/EXIF types.
-- GPS formatting is not just arbitrary decimal text in every context.
-- Partial EXIF output can mislead DigiKam.
-- This tool’s core job is face-region export, not full metadata conversion.
+Stage 1 should export:
 
-The first corrected version should only write:
+- Ordinary Immich asset tags as normalized strings under `asset.tags`.
+- Original tag details under `asset.tag_details` when the API returns IDs or hierarchy values.
+- Asset metadata under `asset.asset_metadata.exif_info`.
+- A top-level `people` index with person-level fields returned by the `/faces` person object.
 
-- XMP/RDF wrapper.
-- MWG face regions.
-- `dc:subject`.
-- Optional DigiKam/Lightroom tags.
-- `xmp:CreatorTool`.
-- `xmp:MetadataDate`.
+Stage 2 should write:
 
-Full EXIF export should be designed and validated separately if needed.
+- `digiKam:TagsList` for ordinary Immich asset tags by default.
+- `dc:subject` for person names and, by default, ordinary asset tags.
+- Optional `digiKam:TagsList` people tags with `people_tag_prefix`.
+- Optional `lr:hierarchicalSubject` for asset and people tags.
+- Selected EXIF/TIFF/Photoshop/XMP fields that are useful in companion XMP: camera make/model, lens, exposure settings, dimensions, capture date, rating, location coordinates, and location names.
+
+The exporter should not claim to preserve every original media metadata field. It stores the source `exif_info` payload in JSON so future XMP mappings can be added without another Immich API scan.
 
 ### 9. Sidecar Naming And Output Location Must Be Explicit
 
@@ -335,9 +338,20 @@ Stage 1 should export a stable schema instead of raw Immich response fragments:
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "exported_at": "2026-05-21T12:00:00+08:00",
   "immich_server": "https://example.com",
+  "people": [
+    {
+      "person_id": "...",
+      "person_name": "John Smith",
+      "is_hidden": false,
+      "is_favorite": false,
+      "birth_date": null,
+      "thumbnail_path": "...",
+      "updated_at": "..."
+    }
+  ],
   "assets": [
     {
       "asset_id": "...",
@@ -345,6 +359,25 @@ Stage 1 should export a stable schema instead of raw Immich response fragments:
       "original_path": "/library/2024/IMG_0001.jpg",
       "width": 4032,
       "height": 3024,
+      "tags": ["Family/John", "Travel/Beijing"],
+      "tag_details": [
+        {
+          "id": "...",
+          "name": "Beijing",
+          "value": "Travel/Beijing",
+          "parent_id": "..."
+        }
+      ],
+      "asset_metadata": {
+        "exif_info": {
+          "make": "Canon",
+          "model": "EOS R5",
+          "dateTimeOriginal": "2024-01-01T12:00:00+08:00",
+          "latitude": 39.9,
+          "longitude": 116.3,
+          "rating": 5
+        }
+      },
       "faces": [
         {
           "face_id": "...",
@@ -365,9 +398,13 @@ Stage 1 should export a stable schema instead of raw Immich response fragments:
   ],
   "stats": {
     "assets_seen": 0,
+    "assets_exported": 0,
     "assets_with_faces": 0,
+    "assets_with_tags": 0,
     "named_faces": 0,
     "unnamed_faces": 0,
+    "asset_tags": 0,
+    "people": 0,
     "skipped_faces": 0
   }
 }
@@ -443,11 +480,11 @@ Recommended order:
 1. Add `ImmichClient` and make timeout/retry settings active.
 2. Update search parameters to current `MetadataSearchDto`.
 3. Add `/faces?id=<asset_id>` fetching.
-4. Upgrade Stage 1 JSON to `schema_version: 2`.
+4. Upgrade Stage 1 JSON to `schema_version: 3`.
 5. Rewrite XMP generation with an XML builder.
 6. Normalize coordinates using face `imageWidth/imageHeight`.
 7. Skip unnamed faces by default.
-8. Remove hand-written EXIF/TIFF output from the face export path.
+8. Add ordinary asset tag and selected metadata export.
 9. Add unit tests and XML parse validation.
 10. Update README usage and compatibility notes.
 
@@ -476,6 +513,9 @@ Target config:
     "sidecar_naming": "extension-xmp",
     "include_unnamed_faces": false,
     "write_dc_subject": true,
+    "write_asset_tags": true,
+    "write_asset_tags_to_dc_subject": true,
+    "write_asset_metadata": true,
     "write_digikam_tags": false,
     "write_lightroom_hierarchical_subject": false,
     "people_tag_prefix": "People"
@@ -495,10 +535,14 @@ Environment variable mappings to add:
 - `OUTPUT_JSON_EXPORT_DIR`
 - `XMP_SIDECAR_NAMING`
 - `XMP_INCLUDE_UNNAMED_FACES`
+- `XMP_WRITE_ASSET_TAGS`
+- `XMP_WRITE_ASSET_TAGS_TO_DC_SUBJECT`
+- `XMP_WRITE_ASSET_METADATA`
 
 ## Risks And Open Questions
 
 - Immich `GET /faces` uses a query parameter named `id`; the docs can be easy to misread. Validate against the actual server response and give clear compatibility errors.
-- The best combination of `digiKam:TagsList` and `lr:hierarchicalSubject` should be confirmed with DigiKam before enabling it by default.
+- The best combination of person-name `digiKam:TagsList` and `lr:hierarchicalSubject` should be confirmed with DigiKam before enabling person tags by default.
+- If an Immich version returns only tag names without hierarchy values, the exporter can preserve the flat name but cannot reconstruct the hierarchy unless the tag list API is also consulted.
 - If the Immich container path differs from the local DigiKam photo path, `originalPath` cannot be used directly for writing next to original photos. A path-mapping config is needed.
 - If faces on one asset report inconsistent `imageWidth/imageHeight`, the script must warn and avoid silently writing bad coordinates.
