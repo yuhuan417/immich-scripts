@@ -268,7 +268,8 @@ Stage 1 should export:
 
 - Ordinary Immich asset tags as normalized strings under `asset.tags`.
 - Original tag details under `asset.tag_details` when the API returns IDs or hierarchy values.
-- Asset metadata under `asset.asset_metadata.exif_info`.
+- The raw Immich metadata payload under `asset.asset_metadata.exif_info`.
+- A normalized metadata summary under `asset.asset_metadata.normalized`, grouped as camera, capture, image, location, and descriptive fields. This makes restore tooling easier without discarding source fields.
 - A top-level `people` index with person-level fields returned by the `/faces` person object.
 
 Stage 2 should write:
@@ -277,7 +278,7 @@ Stage 2 should write:
 - `dc:subject` for person names and, by default, ordinary asset tags.
 - Optional `digiKam:TagsList` people tags with `people_tag_prefix`.
 - Optional `lr:hierarchicalSubject` for asset and people tags.
-- Selected EXIF/TIFF/Photoshop/XMP fields that are useful in companion XMP: camera make/model, lens, exposure settings, dimensions, capture date, rating, location coordinates, and location names.
+- Selected EXIF/TIFF/Photoshop/IPTC/XMP fields that are useful in companion XMP: camera make/model, lens, exposure settings, dimensions, capture and modify dates, rating, GNSS coordinates with refs and WGS-84 datum, altitude, location names, panorama projection type, and description/caption text.
 
 The exporter should not claim to preserve every original media metadata field. It stores the source `exif_info` payload in JSON so future XMP mappings can be added without another Immich API scan.
 
@@ -376,6 +377,25 @@ Stage 1 should export a stable schema instead of raw Immich response fragments:
           "latitude": 39.9,
           "longitude": 116.3,
           "rating": 5
+        },
+        "normalized": {
+          "camera": {
+            "make": "Canon",
+            "model": "EOS R5"
+          },
+          "capture": {
+            "date_time_original": "2024-01-01T12:00:00+08:00"
+          },
+          "location": {
+            "gps": {
+              "latitude": 39.9,
+              "longitude": 116.3,
+              "coordinate_system": "WGS84"
+            }
+          },
+          "descriptive": {
+            "rating": 5
+          }
         }
       },
       "faces": [

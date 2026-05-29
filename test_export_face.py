@@ -16,6 +16,8 @@ NS = {
     "dc": "http://purl.org/dc/elements/1.1/",
     "digiKam": "http://www.digikam.org/ns/1.0/",
     "exif": "http://ns.adobe.com/exif/1.0/",
+    "GPano": "http://ns.google.com/photos/1.0/panorama/",
+    "Iptc4xmpCore": "http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/",
     "mwg-rs": "http://www.metadataworkinggroup.com/schemas/regions/",
     "photoshop": "http://ns.adobe.com/photoshop/1.0/",
     "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
@@ -38,10 +40,22 @@ def sample_asset(person_name="Tom & Jerry <A>"):
                 "make": "Fuji & Co",
                 "model": "X <T>",
                 "dateTimeOriginal": "2024-01-02T03:04:05+08:00",
+                "modifyDate": "2024-01-03T04:05:06+08:00",
+                "description": "A caption & note",
                 "latitude": 39.9,
-                "longitude": 116.3,
+                "longitude": -116.3,
+                "altitude": 88.5,
                 "city": "Beijing",
+                "state": "Beijing",
                 "country": "China",
+                "lensModel": "XF 35mm",
+                "fNumber": 2.8,
+                "exposureTime": "1/125",
+                "iso": 400,
+                "focalLength": 35,
+                "orientation": "1",
+                "rating": 4,
+                "projectionType": "equirectangular",
             }
         },
         "faces": [
@@ -97,7 +111,52 @@ class ExportFaceXmpTests(unittest.TestCase):
         self.assertEqual(root.find(".//tiff:Make", NS).text, "Fuji & Co")
         self.assertEqual(root.find(".//tiff:Model", NS).text, "X <T>")
         self.assertEqual(root.find(".//exif:DateTimeOriginal", NS).text, "2024-01-02T03:04:05+08:00")
+        self.assertEqual(root.find(".//exif:DateTimeDigitized", NS).text, "2024-01-02T03:04:05+08:00")
+        self.assertEqual(root.find(".//exif:LensModel", NS).text, "XF 35mm")
+        self.assertEqual(root.find(".//exif:FNumber", NS).text, "2.8")
+        self.assertEqual(root.find(".//exif:ExposureTime", NS).text, "1/125")
+        self.assertEqual(root.find(".//exif:ISOSpeedRatings", NS).text, "400")
+        self.assertEqual(root.find(".//exif:FocalLength", NS).text, "35")
+        self.assertEqual(root.find(".//exif:GPSLatitude", NS).text, "39,54,0N")
+        self.assertEqual(root.find(".//exif:GPSLatitudeRef", NS).text, "N")
+        self.assertEqual(root.find(".//exif:GPSLongitude", NS).text, "116,18,0W")
+        self.assertEqual(root.find(".//exif:GPSLongitudeRef", NS).text, "W")
+        self.assertEqual(root.find(".//exif:GPSAltitude", NS).text, "88.5")
+        self.assertEqual(root.find(".//exif:GPSAltitudeRef", NS).text, "0")
+        self.assertEqual(root.find(".//exif:GPSMapDatum", NS).text, "WGS-84")
         self.assertEqual(root.find(".//photoshop:City", NS).text, "Beijing")
+        self.assertEqual(root.find(".//photoshop:State", NS).text, "Beijing")
+        self.assertEqual(root.find(".//photoshop:Country", NS).text, "China")
+        self.assertEqual(root.find(".//Iptc4xmpCore:Location", NS).text, "Beijing")
+        self.assertEqual(root.find(".//GPano:ProjectionType", NS).text, "equirectangular")
+        self.assertEqual(root.find(".//dc:description/rdf:Alt/rdf:li", NS).text, "A caption & note")
+        self.assertEqual(root.find(".//tiff:ImageDescription", NS).text, "A caption & note")
+        self.assertEqual(root.find(".//exif:UserComment", NS).text, "A caption & note")
+
+    def test_xmp_writes_normalized_metadata_without_raw_exif_info(self):
+        asset = sample_asset("Alice")
+        asset["asset_metadata"] = {
+            "normalized": {
+                "camera": {"make": "Apple", "model": "iPhone"},
+                "capture": {"date_time_original": "2024-01-02T03:04:05+08:00"},
+                "location": {
+                    "gps": {"latitude": 0, "longitude": 0, "altitude": -3},
+                    "city": "Null Island",
+                },
+                "descriptive": {"description": "Normalized only"},
+            }
+        }
+
+        xmp, stats = build_digikam_xmp(asset)
+        root = ET.fromstring(xmp)
+
+        self.assertGreater(stats["metadata_fields_written"], 0)
+        self.assertEqual(root.find(".//tiff:Make", NS).text, "Apple")
+        self.assertEqual(root.find(".//exif:GPSLatitude", NS).text, "0,0,0N")
+        self.assertEqual(root.find(".//exif:GPSLongitude", NS).text, "0,0,0E")
+        self.assertEqual(root.find(".//exif:GPSAltitude", NS).text, "3")
+        self.assertEqual(root.find(".//exif:GPSAltitudeRef", NS).text, "1")
+        self.assertEqual(root.find(".//dc:description/rdf:Alt/rdf:li", NS).text, "Normalized only")
 
     def test_xmp_contains_immich_importable_region_info_shape(self):
         xmp, _ = build_digikam_xmp(sample_asset("Alice"))
@@ -158,7 +217,14 @@ class ExportFaceXmpTests(unittest.TestCase):
             "width": 2000,
             "height": 1000,
             "tags": [{"id": "tag-1", "name": "Trip", "value": "Places/Trip"}],
-            "exifInfo": {"make": "Canon", "tags": ["Fallback/Tag"]},
+            "exifInfo": {
+                "make": "Canon",
+                "dateTimeOriginal": "2024-01-02T03:04:05+08:00",
+                "description": "Caption",
+                "latitude": 39.9,
+                "longitude": 116.3,
+                "tags": ["Fallback/Tag"],
+            },
         }
         faces = [
             {
@@ -179,6 +245,13 @@ class ExportFaceXmpTests(unittest.TestCase):
         self.assertEqual(normalized["tags"], ["Places/Trip", "Fallback/Tag"])
         self.assertEqual(normalized["tag_details"][0]["id"], "tag-1")
         self.assertEqual(normalized["asset_metadata"]["exif_info"]["make"], "Canon")
+        self.assertEqual(normalized["asset_metadata"]["normalized"]["camera"]["make"], "Canon")
+        self.assertEqual(
+            normalized["asset_metadata"]["normalized"]["capture"]["date_time_original"],
+            "2024-01-02T03:04:05+08:00",
+        )
+        self.assertEqual(normalized["asset_metadata"]["normalized"]["location"]["gps"]["coordinate_system"], "WGS84")
+        self.assertEqual(normalized["asset_metadata"]["normalized"]["descriptive"]["description"], "Caption")
         self.assertEqual(normalized["faces"][0]["person_name"], "Alice")
 
     def test_stage2_writes_default_immich_sidecar_name(self):

@@ -92,6 +92,8 @@ ST_DIM_NS = "http://ns.adobe.com/xap/1.0/sType/Dimensions#"
 ST_AREA_NS = "http://ns.adobe.com/xmp/sType/Area#"
 DIGIKAM_NS = "http://www.digikam.org/ns/1.0/"
 LR_NS = "http://ns.adobe.com/lightroom/1.0/"
+IPTC_CORE_NS = "http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/"
+GPANO_NS = "http://ns.google.com/photos/1.0/panorama/"
 
 for prefix, uri in [
     ("x", X_NS),
@@ -106,6 +108,8 @@ for prefix, uri in [
     ("stArea", ST_AREA_NS),
     ("digiKam", DIGIKAM_NS),
     ("lr", LR_NS),
+    ("Iptc4xmpCore", IPTC_CORE_NS),
+    ("GPano", GPANO_NS),
 ]:
     ET.register_namespace(prefix, uri)
 
@@ -427,6 +431,91 @@ def clean_mapping(data: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
+def first_present(data: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = data.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def first_value(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def metadata_field(data: Dict[str, Any], *keys: str) -> Any:
+    value = first_present(data, *keys)
+    if isinstance(value, (list, dict)):
+        return json_safe(value) if value else None
+    return value
+
+
+def normalized_asset_metadata(exif_info: Dict[str, Any], asset: Dict[str, Any]) -> Dict[str, Any]:
+    """Expose common metadata fields in stable groups while retaining raw exif_info."""
+    width = first_present(exif_info, "exifImageWidth", "imageWidth") or asset.get("width")
+    height = first_present(exif_info, "exifImageHeight", "imageHeight") or asset.get("height")
+
+    gps = clean_mapping(
+        {
+            "latitude": metadata_field(exif_info, "latitude"),
+            "longitude": metadata_field(exif_info, "longitude"),
+            "altitude": metadata_field(exif_info, "altitude", "gpsAltitude"),
+        }
+    )
+    if "latitude" in gps and "longitude" in gps:
+        gps["coordinate_system"] = "WGS84"
+
+    return clean_mapping(
+        {
+            "camera": clean_mapping(
+                {
+                    "make": metadata_field(exif_info, "make"),
+                    "model": metadata_field(exif_info, "model"),
+                    "lens_model": metadata_field(exif_info, "lensModel", "lens"),
+                    "orientation": metadata_field(exif_info, "orientation"),
+                    "projection_type": metadata_field(exif_info, "projectionType"),
+                }
+            ),
+            "capture": clean_mapping(
+                {
+                    "date_time_original": metadata_field(exif_info, "dateTimeOriginal"),
+                    "modify_date": metadata_field(exif_info, "modifyDate"),
+                    "time_zone": metadata_field(exif_info, "timeZone"),
+                    "exposure_time": metadata_field(exif_info, "exposureTime"),
+                    "f_number": metadata_field(exif_info, "fNumber"),
+                    "iso": metadata_field(exif_info, "iso"),
+                    "focal_length": metadata_field(exif_info, "focalLength"),
+                }
+            ),
+            "image": clean_mapping(
+                {
+                    "width": width,
+                    "height": height,
+                    "file_size_in_byte": metadata_field(exif_info, "fileSizeInByte"),
+                }
+            ),
+            "location": clean_mapping(
+                {
+                    "gps": gps,
+                    "city": metadata_field(exif_info, "city"),
+                    "state": metadata_field(exif_info, "state"),
+                    "country": metadata_field(exif_info, "country"),
+                }
+            ),
+            "descriptive": clean_mapping(
+                {
+                    "description": metadata_field(exif_info, "description"),
+                    "rating": metadata_field(exif_info, "rating"),
+                    "tags": metadata_field(exif_info, "tags"),
+                }
+            ),
+        }
+    )
+
+
 def get_all_asset_ids(
     client: ImmichClient,
     search_config: Dict[str, Any],
@@ -615,6 +704,7 @@ def normalize_asset(asset: Dict[str, Any], faces: List[Dict[str, Any]]) -> Dict[
         "tag_details": tag_details,
         "asset_metadata": {
             "exif_info": clean_mapping(exif_info),
+            "normalized": normalized_asset_metadata(exif_info, asset),
         },
         "faces": normalized_faces,
         "stats": {
@@ -795,6 +885,13 @@ def asset_exif_info(asset_data: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def asset_normalized_metadata(asset_data: Dict[str, Any]) -> Dict[str, Any]:
+    asset_metadata = asset_data.get("asset_metadata")
+    if isinstance(asset_metadata, dict) and isinstance(asset_metadata.get("normalized"), dict):
+        return asset_metadata["normalized"]
+    return {}
+
+
 def prepare_xmp_regions(
     asset_data: Dict[str, Any],
     xmp_config: Dict[str, Any],
@@ -900,43 +997,150 @@ def add_text(parent: ET.Element, property_name: str, value: Any) -> bool:
     return True
 
 
+def first_nested(data: Dict[str, Any], *paths: str) -> Any:
+    for path in paths:
+        current: Any = data
+        for part in path.split("."):
+            if not isinstance(current, dict) or part not in current:
+                current = None
+                break
+            current = current[part]
+        if current is not None and current != "":
+            return current
+    return None
+
+
+def decimal_to_exif_gps(value: Any, positive_ref: str, negative_ref: str) -> Tuple[Optional[str], Optional[str]]:
+    if value is None or value == "":
+        return None, None
+    try:
+        decimal = float(value)
+    except (TypeError, ValueError):
+        return None, None
+
+    ref = positive_ref if decimal >= 0 else negative_ref
+    decimal = abs(decimal)
+    degrees = int(decimal)
+    minutes_float = (decimal - degrees) * 60
+    minutes = int(minutes_float)
+    seconds = round((minutes_float - minutes) * 60, 6)
+    if seconds >= 60:
+        seconds = 0.0
+        minutes += 1
+    if minutes >= 60:
+        minutes = 0
+        degrees += 1
+
+    seconds_text = f"{seconds:.6f}".rstrip("0").rstrip(".") or "0"
+    return f"{degrees},{minutes},{seconds_text}{ref}", ref
+
+
+def decimal_to_exif_altitude(value: Any) -> Tuple[Optional[str], Optional[str]]:
+    if value is None or value == "":
+        return None, None
+    try:
+        altitude = float(value)
+    except (TypeError, ValueError):
+        return None, None
+
+    ref = "0" if altitude >= 0 else "1"
+    altitude_text = f"{abs(altitude):.6f}".rstrip("0").rstrip(".") or "0"
+    return altitude_text, ref
+
+
 def add_asset_metadata(description: ET.Element, asset_data: Dict[str, Any]) -> int:
     exif_info = asset_exif_info(asset_data)
-    if not exif_info:
+    normalized = asset_normalized_metadata(asset_data)
+    if not exif_info and not normalized:
         return 0
 
     written = 0
-    written += int(add_text(description, qname(TIFF_NS, "Make"), exif_info.get("make")))
-    written += int(add_text(description, qname(TIFF_NS, "Model"), exif_info.get("model")))
-    written += int(add_text(description, qname(EXIF_NS, "LensModel"), exif_info.get("lensModel")))
-    written += int(add_text(description, qname(EXIF_NS, "FNumber"), exif_info.get("fNumber")))
-    written += int(add_text(description, qname(EXIF_NS, "ExposureTime"), exif_info.get("exposureTime")))
-    written += int(add_text(description, qname(EXIF_NS, "ISOSpeedRatings"), exif_info.get("iso")))
-    written += int(add_text(description, qname(EXIF_NS, "FocalLength"), exif_info.get("focalLength")))
+    written += int(add_text(description, qname(TIFF_NS, "Make"), first_value(first_nested(normalized, "camera.make"), exif_info.get("make"))))
+    written += int(
+        add_text(description, qname(TIFF_NS, "Model"), first_value(first_nested(normalized, "camera.model"), exif_info.get("model")))
+    )
+    written += int(
+        add_text(
+            description,
+            qname(EXIF_NS, "LensModel"),
+            first_value(first_nested(normalized, "camera.lens_model"), first_present(exif_info, "lensModel", "lens")),
+        )
+    )
+    written += int(add_text(description, qname(TIFF_NS, "Orientation"), first_nested(normalized, "camera.orientation")))
+    written += int(add_text(description, qname(EXIF_NS, "FNumber"), first_value(first_nested(normalized, "capture.f_number"), exif_info.get("fNumber"))))
+    written += int(
+        add_text(
+            description,
+            qname(EXIF_NS, "ExposureTime"),
+            first_value(first_nested(normalized, "capture.exposure_time"), exif_info.get("exposureTime")),
+        )
+    )
+    written += int(add_text(description, qname(EXIF_NS, "ISOSpeedRatings"), first_value(first_nested(normalized, "capture.iso"), exif_info.get("iso"))))
+    written += int(
+        add_text(
+            description,
+            qname(EXIF_NS, "FocalLength"),
+            first_value(first_nested(normalized, "capture.focal_length"), exif_info.get("focalLength")),
+        )
+    )
 
-    width = exif_info.get("exifImageWidth") or asset_data.get("width")
-    height = exif_info.get("exifImageHeight") or asset_data.get("height")
+    width = first_value(
+        first_nested(normalized, "image.width"),
+        first_present(exif_info, "exifImageWidth", "imageWidth"),
+        asset_data.get("width"),
+    )
+    height = first_value(
+        first_nested(normalized, "image.height"),
+        first_present(exif_info, "exifImageHeight", "imageHeight"),
+        asset_data.get("height"),
+    )
     written += int(add_text(description, qname(TIFF_NS, "ImageWidth"), width))
     written += int(add_text(description, qname(TIFF_NS, "ImageLength"), height))
     written += int(add_text(description, qname(EXIF_NS, "ExifImageWidth"), width))
     written += int(add_text(description, qname(EXIF_NS, "ExifImageHeight"), height))
+    written += int(add_text(description, qname(EXIF_NS, "PixelXDimension"), width))
+    written += int(add_text(description, qname(EXIF_NS, "PixelYDimension"), height))
 
-    date_original = exif_info.get("dateTimeOriginal")
+    date_original = first_value(first_nested(normalized, "capture.date_time_original"), exif_info.get("dateTimeOriginal"))
+    modify_date = first_value(first_nested(normalized, "capture.modify_date"), exif_info.get("modifyDate"))
     written += int(add_text(description, qname(EXIF_NS, "DateTimeOriginal"), date_original))
+    written += int(add_text(description, qname(EXIF_NS, "DateTimeDigitized"), date_original))
     written += int(add_text(description, qname(PHOTOSHOP_NS, "DateCreated"), date_original))
-    written += int(add_text(description, qname(XMP_NS, "Rating"), exif_info.get("rating")))
+    written += int(add_text(description, qname(XMP_NS, "CreateDate"), date_original))
+    written += int(add_text(description, qname(XMP_NS, "ModifyDate"), modify_date))
+    written += int(add_text(description, qname(XMP_NS, "Rating"), first_value(first_nested(normalized, "descriptive.rating"), exif_info.get("rating"))))
 
-    written += int(add_text(description, qname(EXIF_NS, "GPSLatitude"), exif_info.get("latitude")))
-    written += int(add_text(description, qname(EXIF_NS, "GPSLongitude"), exif_info.get("longitude")))
-    written += int(add_text(description, qname(PHOTOSHOP_NS, "City"), exif_info.get("city")))
-    written += int(add_text(description, qname(PHOTOSHOP_NS, "State"), exif_info.get("state")))
-    written += int(add_text(description, qname(PHOTOSHOP_NS, "Country"), exif_info.get("country")))
+    latitude = first_value(first_nested(normalized, "location.gps.latitude"), exif_info.get("latitude"))
+    longitude = first_value(first_nested(normalized, "location.gps.longitude"), exif_info.get("longitude"))
+    altitude = first_value(first_nested(normalized, "location.gps.altitude"), first_present(exif_info, "altitude", "gpsAltitude"))
+    gps_latitude, gps_latitude_ref = decimal_to_exif_gps(latitude, "N", "S")
+    gps_longitude, gps_longitude_ref = decimal_to_exif_gps(longitude, "E", "W")
+    gps_altitude, gps_altitude_ref = decimal_to_exif_altitude(altitude)
+    written += int(add_text(description, qname(EXIF_NS, "GPSLatitude"), gps_latitude or latitude))
+    written += int(add_text(description, qname(EXIF_NS, "GPSLatitudeRef"), gps_latitude_ref))
+    written += int(add_text(description, qname(EXIF_NS, "GPSLongitude"), gps_longitude or longitude))
+    written += int(add_text(description, qname(EXIF_NS, "GPSLongitudeRef"), gps_longitude_ref))
+    written += int(add_text(description, qname(EXIF_NS, "GPSAltitude"), gps_altitude or altitude))
+    written += int(add_text(description, qname(EXIF_NS, "GPSAltitudeRef"), gps_altitude_ref))
+    written += int(add_text(description, qname(EXIF_NS, "GPSMapDatum"), "WGS-84" if latitude is not None and longitude is not None else None))
+    written += int(
+        add_text(description, qname(IPTC_CORE_NS, "Location"), first_value(first_nested(normalized, "location.city"), exif_info.get("city")))
+    )
+    written += int(add_text(description, qname(PHOTOSHOP_NS, "City"), first_value(first_nested(normalized, "location.city"), exif_info.get("city"))))
+    written += int(add_text(description, qname(PHOTOSHOP_NS, "State"), first_value(first_nested(normalized, "location.state"), exif_info.get("state"))))
+    written += int(
+        add_text(description, qname(PHOTOSHOP_NS, "Country"), first_value(first_nested(normalized, "location.country"), exif_info.get("country")))
+    )
 
-    description_text = exif_info.get("description")
+    projection_type = first_value(first_nested(normalized, "camera.projection_type"), exif_info.get("projectionType"))
+    written += int(add_text(description, qname(GPANO_NS, "ProjectionType"), projection_type))
+
+    description_text = first_value(first_nested(normalized, "descriptive.description"), exif_info.get("description"))
     if description_text:
         add_rdf_alt(description, qname(DC_NS, "description"), str(description_text))
         written += 1
         written += int(add_text(description, qname(TIFF_NS, "ImageDescription"), description_text))
+        written += int(add_text(description, qname(EXIF_NS, "UserComment"), description_text))
 
     return written
 
@@ -976,7 +1180,8 @@ def build_digikam_xmp(
     lightroom_tags = ordered_unique(lightroom_tags)
 
     exif_info = asset_exif_info(asset_data)
-    should_write_metadata = bool(config.get("write_asset_metadata", True) and exif_info)
+    normalized_metadata = asset_normalized_metadata(asset_data)
+    should_write_metadata = bool(config.get("write_asset_metadata", True) and (exif_info or normalized_metadata))
 
     if not regions and not subject_values and not digikam_tags and not lightroom_tags and not should_write_metadata:
         return "", stats
@@ -989,7 +1194,6 @@ def build_digikam_xmp(
 
     ET.SubElement(description, qname(XMP_NS, "CreatorTool")).text = "Immich Face Export Script"
     ET.SubElement(description, qname(XMP_NS, "MetadataDate")).text = created_at
-    ET.SubElement(description, qname(XMP_NS, "ModifyDate")).text = created_at
 
     metadata_fields_written = 0
     if should_write_metadata:
