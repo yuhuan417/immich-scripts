@@ -1,6 +1,0 @@
-# Pinned dependencies for PP-OCRv5 Paddle download and Paddle -> ONNX export.
-numpy==1.24.4
-onnx==1.17.0
-paddle2onnx==2.0.2rc1
-paddlepaddle==3.0.0
-protobuf==4.25.4
